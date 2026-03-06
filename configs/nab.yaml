@@ -1,0 +1,14 @@
+dataset: nab
+dataset_root: Datasets/NAB/realAWSCloudwatch/realAWSCloudwatch
+series:
+  - ec2_cpu_utilization_5f5533
+  - rds_cpu_utilization_cc0c53
+  - ec2_network_in_257a54
+
+labels_json: Datasets/NAB/labels/combined_windows.json
+
+default_model_set:
+  - zscore
+  - iforest
+  - lstm_ae
+  - cnn_ae

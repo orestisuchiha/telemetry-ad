@@ -1,0 +1,14 @@
+dataset: skab
+train_file: Datasets/SKAB/anomaly-free/anomaly-free.csv
+test_files:
+  primary: Datasets/SKAB/valve1/1.csv
+  optional_secondary: Datasets/SKAB/valve1/2.csv
+separator: ";"
+
+split_name: anomalyfree_vs_valve1_1
+
+default_model_set:
+  - zscore
+  - iforest
+  - lstm_ae
+  - cnn_ae

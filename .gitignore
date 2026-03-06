@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Artifacts and runtime outputs
+artifacts/*
+!artifacts/.gitkeep
+logs/*
+!logs/.gitkeep
+reports/*
+!reports/.gitkeep
+
+# OS/editor
+.DS_Store
+Thumbs.db
+Datasets/
