@@ -1,6 +1,6 @@
 # telemetry-ad
 
-Minimal but complete organization for Project 2 (Telemetry Anomaly Detection).
+Project for Anomaly Detection on Time-Series telemetry
 
 ## Scope
 - Datasets: NAB realAWSCloudwatch and SKAB
