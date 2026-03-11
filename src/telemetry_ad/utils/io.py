@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import joblib
+import yaml
 
 
 def save_pickle(obj, path: str) -> None:
@@ -19,3 +20,8 @@ def save_json(payload: dict, path: str) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
+
+
+def load_yaml(path: str) -> dict:
+    with Path(path).open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}

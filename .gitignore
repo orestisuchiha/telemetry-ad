@@ -18,3 +18,5 @@ reports/*
 .DS_Store
 Thumbs.db
 Datasets/
+
+Project*.md
