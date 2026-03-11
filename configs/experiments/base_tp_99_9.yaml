@@ -1,0 +1,18 @@
+﻿project:
+  name: telemetry-ad
+
+training:
+  seed: 42
+  window_size: 60
+  stride: 1
+  threshold_percentile: 99.9
+
+preprocessing:
+  resample_rule: null
+  forward_fill: true
+  interpolate: false
+  ewma_alpha: null
+  standardize: true
+
+inference:
+  alert_min_segment_length: 3

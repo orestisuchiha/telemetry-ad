@@ -1,0 +1,7 @@
+﻿"dataset","series","model","f1","precision","recall"
+"nab","ec2_cpu_utilization_5f5533","iforest","0.218637992831541","0.149509803921569","0.406666666666667"
+"nab","ec2_cpu_utilization_5f5533","zscore","0.161470823341327","0.0917347865576748","0.673333333333333"
+"nab","ec2_network_in_257a54","iforest","0","0","0"
+"nab","ec2_network_in_257a54","zscore","0","0","0"
+"nab","rds_cpu_utilization_cc0c53","iforest","0.446085672082718","0.317226890756303","0.751243781094527"
+"nab","rds_cpu_utilization_cc0c53","zscore","0.446085672082718","0.317226890756303","0.751243781094527"

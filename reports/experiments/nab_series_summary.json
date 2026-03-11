@@ -1,0 +1,50 @@
+﻿[
+    {
+        "dataset":  "nab",
+        "series":  "ec2_cpu_utilization_5f5533",
+        "model":  "iforest",
+        "f1":  0.21863799283154123,
+        "precision":  0.14950980392156862,
+        "recall":  0.40666666666666668
+    },
+    {
+        "dataset":  "nab",
+        "series":  "ec2_cpu_utilization_5f5533",
+        "model":  "zscore",
+        "f1":  0.16147082334132695,
+        "precision":  0.091734786557674836,
+        "recall":  0.67333333333333334
+    },
+    {
+        "dataset":  "nab",
+        "series":  "ec2_network_in_257a54",
+        "model":  "iforest",
+        "f1":  0,
+        "precision":  0,
+        "recall":  0
+    },
+    {
+        "dataset":  "nab",
+        "series":  "ec2_network_in_257a54",
+        "model":  "zscore",
+        "f1":  0,
+        "precision":  0,
+        "recall":  0
+    },
+    {
+        "dataset":  "nab",
+        "series":  "rds_cpu_utilization_cc0c53",
+        "model":  "iforest",
+        "f1":  0.44608567208271788,
+        "precision":  0.3172268907563025,
+        "recall":  0.75124378109452739
+    },
+    {
+        "dataset":  "nab",
+        "series":  "rds_cpu_utilization_cc0c53",
+        "model":  "zscore",
+        "f1":  0.44608567208271788,
+        "precision":  0.3172268907563025,
+        "recall":  0.75124378109452739
+    }
+]

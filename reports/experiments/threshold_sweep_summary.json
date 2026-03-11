@@ -1,0 +1,110 @@
+﻿[
+    {
+        "threshold_percentile":  99,
+        "dataset":  "nab",
+        "variant":  "ec2_cpu_utilization_5f5533",
+        "model":  "iforest",
+        "f1":  0.12081632653061224,
+        "precision":  0.068837209302325578,
+        "recall":  0.49333333333333335
+    },
+    {
+        "threshold_percentile":  99.5,
+        "dataset":  "nab",
+        "variant":  "ec2_cpu_utilization_5f5533",
+        "model":  "iforest",
+        "f1":  0.1084634346754314,
+        "precision":  0.061855670103092786,
+        "recall":  0.44
+    },
+    {
+        "threshold_percentile":  99.9,
+        "dataset":  "nab",
+        "variant":  "ec2_cpu_utilization_5f5533",
+        "model":  "iforest",
+        "f1":  0.21863799283154123,
+        "precision":  0.14950980392156862,
+        "recall":  0.40666666666666668
+    },
+    {
+        "threshold_percentile":  99,
+        "dataset":  "nab",
+        "variant":  "ec2_cpu_utilization_5f5533",
+        "model":  "zscore",
+        "f1":  0.16147082334132695,
+        "precision":  0.091734786557674836,
+        "recall":  0.67333333333333334
+    },
+    {
+        "threshold_percentile":  99.5,
+        "dataset":  "nab",
+        "variant":  "ec2_cpu_utilization_5f5533",
+        "model":  "zscore",
+        "f1":  0.16147082334132695,
+        "precision":  0.091734786557674836,
+        "recall":  0.67333333333333334
+    },
+    {
+        "threshold_percentile":  99.9,
+        "dataset":  "nab",
+        "variant":  "ec2_cpu_utilization_5f5533",
+        "model":  "zscore",
+        "f1":  0.16147082334132695,
+        "precision":  0.091734786557674836,
+        "recall":  0.67333333333333334
+    },
+    {
+        "threshold_percentile":  99,
+        "dataset":  "skab",
+        "variant":  "anomalyfree_vs_valve1_1",
+        "model":  "iforest",
+        "f1":  0.37672281776416539,
+        "precision":  0.49003984063745021,
+        "recall":  0.30597014925373134
+    },
+    {
+        "threshold_percentile":  99.5,
+        "dataset":  "skab",
+        "variant":  "anomalyfree_vs_valve1_1",
+        "model":  "iforest",
+        "f1":  0.27985074626865669,
+        "precision":  0.55970149253731338,
+        "recall":  0.18656716417910449
+    },
+    {
+        "threshold_percentile":  99.9,
+        "dataset":  "skab",
+        "variant":  "anomalyfree_vs_valve1_1",
+        "model":  "iforest",
+        "f1":  0.15419501133786848,
+        "precision":  0.87179487179487181,
+        "recall":  0.0845771144278607
+    },
+    {
+        "threshold_percentile":  99,
+        "dataset":  "skab",
+        "variant":  "anomalyfree_vs_valve1_1",
+        "model":  "zscore",
+        "f1":  0,
+        "precision":  0,
+        "recall":  0
+    },
+    {
+        "threshold_percentile":  99.5,
+        "dataset":  "skab",
+        "variant":  "anomalyfree_vs_valve1_1",
+        "model":  "zscore",
+        "f1":  0,
+        "precision":  0,
+        "recall":  0
+    },
+    {
+        "threshold_percentile":  99.9,
+        "dataset":  "skab",
+        "variant":  "anomalyfree_vs_valve1_1",
+        "model":  "zscore",
+        "f1":  0,
+        "precision":  0,
+        "recall":  0
+    }
+]

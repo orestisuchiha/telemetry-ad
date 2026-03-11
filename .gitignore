@@ -7,15 +7,23 @@ __pycache__/
 venv/
 
 # Artifacts and runtime outputs
-artifacts/*
-!artifacts/.gitkeep
 logs/*
 !logs/.gitkeep
-reports/*
+artifacts/**
+!artifacts/.gitkeep
+
+reports/**
 !reports/.gitkeep
+!reports/experiments/
+reports/experiments/**
+!reports/experiments/threshold_sweep_summary.csv
+!reports/experiments/threshold_sweep_summary.json
+!reports/experiments/nab_series_summary.csv
+!reports/experiments/nab_series_summary.json
 
 # OS/editor
 .DS_Store
 Thumbs.db
+
 
 Project*.md

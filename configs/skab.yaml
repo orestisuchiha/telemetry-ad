@@ -1,5 +1,7 @@
 dataset: skab
 train_file: Datasets/SKAB/anomaly-free/anomaly-free.csv
+training:
+  threshold_percentile: 99.0
 test_files:
   primary: Datasets/SKAB/valve1/1.csv
   optional_secondary: Datasets/SKAB/valve1/2.csv

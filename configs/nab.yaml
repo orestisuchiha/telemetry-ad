@@ -1,5 +1,7 @@
 dataset: nab
 dataset_root: Datasets/NAB/realAWSCloudwatch/realAWSCloudwatch
+training:
+  threshold_percentile: 99.9
 series:
   - ec2_cpu_utilization_5f5533
   - rds_cpu_utilization_cc0c53
