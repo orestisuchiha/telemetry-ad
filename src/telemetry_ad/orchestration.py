@@ -12,7 +12,8 @@ from sklearn.metrics import confusion_matrix
 from sklearn.preprocessing import StandardScaler
 
 from telemetry_ad.dataset_io import load_nab_dataset, load_skab_dataset
-from telemetry_ad.evaluation.metrics import point_metrics
+from telemetry_ad.evaluation.metrics import point_metrics, score_metrics
+from telemetry_ad.evaluation.postprocess import event_overlap_metrics, event_type_counts, extract_events
 from telemetry_ad.models.iforest import make_iforest
 from telemetry_ad.models.zscore import fit_robust_baseline, score_robust_z
 from telemetry_ad.preprocessing.features import build_multivariate_features, build_univariate_features
@@ -135,6 +136,27 @@ def _save_plot(
     plt.close(fig)
 
 
+def _save_confusion_plot(path: Path, cm: list[list[int]], title: str) -> None:
+    arr = np.asarray(cm, dtype=int)
+    fig, ax = plt.subplots(figsize=(4, 3.5))
+    ax.imshow(arr, cmap="Blues")
+    ax.set_title(title)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_xticks([0, 1])
+    ax.set_yticks([0, 1])
+    for i in range(arr.shape[0]):
+        for j in range(arr.shape[1]):
+            ax.text(j, i, int(arr[i, j]), ha="center", va="center", color="black")
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def _fmt_metric(value) -> str:
+    return "NA" if value is None else f"{float(value):.4f}"
+
+
 def train_offline(args) -> None:
     cfg = _load_runtime_config(dataset=args.dataset, base_config_path=args.config)
     seed = int(cfg.get("training", {}).get("seed", 42))
@@ -250,17 +272,49 @@ def evaluate_offline(args) -> None:
     if_scores = -iforest.score_samples(X_test_scaled)
     if_pred = (if_scores > float(thresholds["iforest"])).astype(int)
 
+    min_collective = int(cfg.get("inference", {}).get("alert_min_segment_length", 3))
+    true_events = extract_events(y_true, ts, min_collective=min_collective)
+    z_events = extract_events(z_pred, ts, min_collective=min_collective)
+    if_events = extract_events(if_pred, ts, min_collective=min_collective)
+
     z_metrics = point_metrics(y_true, z_pred)
     if_metrics = point_metrics(y_true, if_pred)
+    z_rank_metrics = score_metrics(y_true, z_scores)
+    if_rank_metrics = score_metrics(y_true, if_scores)
+    z_event_metrics = event_overlap_metrics(true_events, z_events)
+    if_event_metrics = event_overlap_metrics(true_events, if_events)
     z_cm = confusion_matrix(y_true, z_pred, labels=[0, 1]).tolist()
     if_cm = confusion_matrix(y_true, if_pred, labels=[0, 1]).tolist()
+
+    save_json(true_events, str(report_dir / "events_true.json"))
+    save_json(z_events, str(report_dir / "events_zscore.json"))
+    save_json(if_events, str(report_dir / "events_iforest.json"))
 
     save_json(
         {
             "dataset": args.dataset,
             "variant": variant,
-            "zscore": {**z_metrics, "confusion_matrix": z_cm},
-            "iforest": {**if_metrics, "confusion_matrix": if_cm},
+            "settings": {"min_collective_event_length": min_collective},
+            "ground_truth": {
+                "event_count": len(true_events),
+                "event_type_counts": event_type_counts(true_events),
+            },
+            "zscore": {
+                **z_metrics,
+                **z_rank_metrics,
+                **z_event_metrics,
+                "pred_event_count": len(z_events),
+                "pred_event_type_counts": event_type_counts(z_events),
+                "confusion_matrix": z_cm,
+            },
+            "iforest": {
+                **if_metrics,
+                **if_rank_metrics,
+                **if_event_metrics,
+                "pred_event_count": len(if_events),
+                "pred_event_type_counts": event_type_counts(if_events),
+                "confusion_matrix": if_cm,
+            },
         },
         str(report_dir / "metrics.json"),
     )
@@ -297,10 +351,24 @@ def evaluate_offline(args) -> None:
         threshold=float(thresholds["iforest"]),
         title=f"{args.dataset}:{variant} Isolation Forest",
     )
+    _save_confusion_plot(
+        path=report_dir / "zscore_confusion_matrix.png",
+        cm=z_cm,
+        title=f"{args.dataset}:{variant} Z-score CM",
+    )
+    _save_confusion_plot(
+        path=report_dir / "iforest_confusion_matrix.png",
+        cm=if_cm,
+        title=f"{args.dataset}:{variant} IF CM",
+    )
 
     print(f"[eval] dataset={args.dataset} variant={variant}")
     print(f"[eval] reports={report_dir}")
     print(f"[eval] zscore_f1={z_metrics['f1']:.4f} iforest_f1={if_metrics['f1']:.4f}")
+    print(
+        f"[eval] zscore_event_f1={_fmt_metric(z_event_metrics['event_f1'])} "
+        f"iforest_event_f1={_fmt_metric(if_event_metrics['event_f1'])}"
+    )
 
 
 def infer_stream_pi(args) -> None:
