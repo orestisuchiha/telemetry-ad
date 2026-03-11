@@ -7,6 +7,14 @@ training:
   stride: 1
   threshold_percentile: 99.5
 
+advanced:
+  enabled: true
+  device: cpu
+  epochs: 8
+  batch_size: 128
+  lr: 0.001
+  lstm_hidden_dim: 32
+
 preprocessing:
   resample_rule: null
   forward_fill: true
