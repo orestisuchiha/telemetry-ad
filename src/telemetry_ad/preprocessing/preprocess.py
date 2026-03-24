@@ -21,6 +21,7 @@ def basic_preprocess(
     forward_fill: bool = True,
     interpolate: bool | str | None = None,
     interpolate_limit_direction: str = "both",
+    rolling_detrend_window: int | None = None,
     ewma_alpha: float | None = None,
     exclude_cols: list[str] | None = None,
 ) -> pd.DataFrame:
@@ -55,6 +56,12 @@ def basic_preprocess(
 
     if forward_fill:
         out = out.ffill()
+
+    if rolling_detrend_window is not None and numeric_cols:
+        window = int(rolling_detrend_window)
+        if window > 1:
+            trend = out[numeric_cols].rolling(window=window, min_periods=1).mean()
+            out[numeric_cols] = out[numeric_cols] - trend
 
     if ewma_alpha is not None:
         out[numeric_cols] = out[numeric_cols].ewm(alpha=ewma_alpha).mean()

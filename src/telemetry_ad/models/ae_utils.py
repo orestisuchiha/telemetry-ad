@@ -93,3 +93,34 @@ def reconstruction_scores(
         recon = model(x)
         mse = ((recon - x) ** 2).mean(dim=(1, 2))
     return mse.detach().cpu().numpy()
+
+
+@torch.no_grad()
+def reconstruction_error_breakdown(
+    model: nn.Module,
+    windows: np.ndarray,
+    device: str,
+    model_type: str,
+) -> dict:
+    model = model.to(device)
+    model.eval()
+    x = torch.tensor(windows, dtype=torch.float32, device=device)
+    if model_type == "cnn":
+        inp = x.permute(0, 2, 1)
+        recon = model(inp)
+        err = (recon - inp) ** 2
+        score = err.mean(dim=(1, 2))
+        channel_error = err.mean(dim=2)
+        timestep_error = err.mean(dim=1)
+    else:
+        recon = model(x)
+        err = (recon - x) ** 2
+        score = err.mean(dim=(1, 2))
+        channel_error = err.mean(dim=1)
+        timestep_error = err.mean(dim=2)
+
+    return {
+        "scores": score.detach().cpu().numpy(),
+        "channel_error": channel_error.detach().cpu().numpy(),
+        "timestep_error": timestep_error.detach().cpu().numpy(),
+    }

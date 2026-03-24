@@ -6,6 +6,7 @@ training:
   window_size: 60
   stride: 1
   threshold_percentile: 99.5
+  model_threshold_percentiles: {}
 
 advanced:
   enabled: true
@@ -14,12 +15,14 @@ advanced:
   batch_size: 128
   lr: 0.001
   lstm_hidden_dim: 32
+  models: {}
 
 preprocessing:
   resample_rule: null
   forward_fill: true
   interpolate: false
   interpolate_limit_direction: both
+  rolling_detrend_window: null
   ewma_alpha: null
   standardize: true
 
@@ -28,6 +31,14 @@ feature_engineering:
     - 1
     - 5
     - 10
+  fft:
+    enabled: true
+    include_dc: false
+  seasonality_analysis:
+    enabled: true
+    period: null
+    signal_column: null
+    robust: true
 
 inference:
   alert_min_segment_length: 3
@@ -38,4 +49,19 @@ inference:
     default:
       mode: artifact
       percentile: 99.5
+    search:
+      enabled: false
+      optimize_metric: f1
+      prefer_lower_alert_rate: true
+      max_alert_rate: null
+      default_candidate_percentiles: []
     models: {}
+
+interpretation:
+  enabled: true
+  drift_min_length: 120
+  drift_length_ratio: 0.25
+
+nonstationarity:
+  enabled: true
+  segment_count: 3

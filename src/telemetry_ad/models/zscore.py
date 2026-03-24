@@ -9,9 +9,13 @@ def fit_robust_baseline(x: np.ndarray) -> dict:
     return {"median": med, "mad": mad}
 
 
-def score_robust_z(x: np.ndarray, params: dict) -> np.ndarray:
+def featurewise_robust_z(x: np.ndarray, params: dict) -> np.ndarray:
     arr = np.asarray(x, dtype=float)
-    z = 0.6745 * np.abs((arr - params["median"]) / params["mad"])
+    return 0.6745 * np.abs((arr - params["median"]) / params["mad"])
+
+
+def score_robust_z(x: np.ndarray, params: dict) -> np.ndarray:
+    z = featurewise_robust_z(x, params)
     if z.ndim == 1:
         return z
     return z.max(axis=1)

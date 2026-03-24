@@ -41,6 +41,12 @@ def _load_test_frame(dataset: str, series: str | None, split: str | None, config
             series=selected_series,
             labels_json=cfg.get("labels_json"),
             train_ratio=float(cfg.get("training", {}).get("train_ratio", 0.7)),
+            split_strategy=str(cfg.get("training", {}).get("split_strategy", "ratio")),
+            test_normal_prefix_points=int(cfg.get("training", {}).get("test_normal_prefix_points", 0)),
+            min_train_points=int(cfg.get("training", {}).get("min_train_points", 1)),
+            drop_labeled_anomalies_from_train=bool(
+                cfg.get("training", {}).get("drop_labeled_anomalies_from_train", False)
+            ),
         )
     else:
         bundle = load_skab_dataset(

@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
@@ -83,11 +84,41 @@ def _labels_from_windows(labels_json: str, series_file: Path, timestamps: pd.Ser
     return labels
 
 
+def _resolve_nab_split_idx(
+    labels: pd.Series,
+    train_ratio: float,
+    split_strategy: str = "ratio",
+    test_normal_prefix_points: int = 0,
+    min_train_points: int = 1,
+) -> int:
+    total = len(labels)
+    split_idx = max(int(min_train_points), int(total * train_ratio))
+    split_idx = max(1, min(split_idx, total - 1))
+    if str(split_strategy) != "anomaly_aware":
+        return split_idx
+
+    anomaly_idx = np.flatnonzero(labels.to_numpy(dtype=int) > 0)
+    if len(anomaly_idx) == 0:
+        return split_idx
+
+    first_anomaly = int(anomaly_idx[0])
+    desired_split = first_anomaly - int(test_normal_prefix_points)
+    if desired_split <= 0:
+        return split_idx
+    desired_split = max(int(min_train_points), desired_split)
+    desired_split = min(desired_split, total - 1)
+    return min(split_idx, desired_split)
+
+
 def load_nab_dataset(
     dataset_root: str,
     series: str,
     labels_json: str | None,
     train_ratio: float = 0.7,
+    split_strategy: str = "ratio",
+    test_normal_prefix_points: int = 0,
+    min_train_points: int = 1,
+    drop_labeled_anomalies_from_train: bool = False,
 ) -> DatasetBundle:
     series_file = _find_nab_series_file(dataset_root=dataset_root, series=series)
     df = pd.read_csv(series_file)
@@ -104,10 +135,17 @@ def load_nab_dataset(
     labels = _labels_from_windows(labels_json=labels_json or "", series_file=series_file, timestamps=df["timestamp"])
     df["label"] = labels
 
-    split_idx = max(1, int(len(df) * train_ratio))
-    split_idx = min(split_idx, len(df) - 1)
+    split_idx = _resolve_nab_split_idx(
+        labels=labels,
+        train_ratio=train_ratio,
+        split_strategy=split_strategy,
+        test_normal_prefix_points=test_normal_prefix_points,
+        min_train_points=min_train_points,
+    )
 
     train_df = df.iloc[:split_idx].reset_index(drop=True)
+    if drop_labeled_anomalies_from_train and "label" in train_df.columns:
+        train_df = train_df.loc[train_df["label"].astype(int) == 0].reset_index(drop=True)
     test_df = df.iloc[split_idx:].reset_index(drop=True)
     return DatasetBundle(
         train_df=train_df,

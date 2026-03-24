@@ -15,14 +15,36 @@ from sklearn.metrics import confusion_matrix
 from sklearn.preprocessing import StandardScaler
 
 from telemetry_ad.dataset_io import load_nab_dataset, load_skab_dataset
+from telemetry_ad.evaluation.explanations import (
+    explain_autoencoder_events,
+    explain_iforest_events,
+    explain_zscore_events,
+    save_model_comparison_summary,
+)
+from telemetry_ad.evaluation.interpretation import (
+    interpretation_counts,
+    interpret_events,
+    save_operational_interpretation_summary,
+)
 from telemetry_ad.evaluation.metrics import point_metrics, score_metrics
+from telemetry_ad.evaluation.nonstationarity import (
+    build_nonstationarity_report,
+    save_nonstationarity_summary,
+)
 from telemetry_ad.evaluation.postprocess import event_overlap_metrics, event_type_counts, extract_events
-from telemetry_ad.models.ae_utils import make_windows, reconstruction_scores, train_cnn_autoencoder, train_lstm_autoencoder
+from telemetry_ad.evaluation.seasonality import run_stl_seasonality_analysis
+from telemetry_ad.models.ae_utils import (
+    make_windows,
+    reconstruction_error_breakdown,
+    reconstruction_scores,
+    train_cnn_autoencoder,
+    train_lstm_autoencoder,
+)
 from telemetry_ad.models.cnn_ae import CNNAutoencoder
 from telemetry_ad.models.iforest import make_iforest
 from telemetry_ad.models.lstm_ae import LSTMAutoencoder
-from telemetry_ad.models.zscore import fit_robust_baseline, score_robust_z
-from telemetry_ad.preprocessing.features import build_multivariate_features, build_univariate_features
+from telemetry_ad.models.zscore import featurewise_robust_z, fit_robust_baseline, score_robust_z
+from telemetry_ad.preprocessing.features import build_multivariate_features, build_univariate_features, fft_window_energy
 from telemetry_ad.preprocessing.preprocess import basic_preprocess
 from telemetry_ad.streaming.alerting import append_alert
 from telemetry_ad.streaming.stream import RingBuffer
@@ -57,6 +79,12 @@ def _load_bundle(args, cfg):
             series=series,
             labels_json=cfg.get("labels_json"),
             train_ratio=float(cfg.get("training", {}).get("train_ratio", 0.7)),
+            split_strategy=str(cfg.get("training", {}).get("split_strategy", "ratio")),
+            test_normal_prefix_points=int(cfg.get("training", {}).get("test_normal_prefix_points", 0)),
+            min_train_points=int(cfg.get("training", {}).get("min_train_points", 1)),
+            drop_labeled_anomalies_from_train=bool(
+                cfg.get("training", {}).get("drop_labeled_anomalies_from_train", False)
+            ),
         )
 
     test_files = cfg.get("test_files", {})
@@ -77,6 +105,7 @@ def _prepare_split(df, timestamp_col: str, label_col: str, cfg: dict):
         forward_fill=bool(pre.get("forward_fill", True)),
         interpolate=pre.get("interpolate"),
         interpolate_limit_direction=str(pre.get("interpolate_limit_direction", "both")),
+        rolling_detrend_window=pre.get("rolling_detrend_window"),
         ewma_alpha=pre.get("ewma_alpha"),
         exclude_cols=[label_col],
     )
@@ -91,6 +120,27 @@ def _lag_steps(cfg: dict, window_size: int) -> list[int]:
     return steps
 
 
+def _fft_settings(cfg: dict) -> dict:
+    feat_cfg = cfg.get("feature_engineering", {})
+    fft_cfg = feat_cfg.get("fft", {})
+    return {
+        "enabled": bool(fft_cfg.get("enabled", False)),
+        "include_dc": bool(fft_cfg.get("include_dc", False)),
+    }
+
+
+def _seasonality_settings(cfg: dict) -> dict:
+    feat_cfg = cfg.get("feature_engineering", {})
+    season_cfg = feat_cfg.get("seasonality_analysis", {})
+    raw_period = season_cfg.get("period")
+    return {
+        "enabled": bool(season_cfg.get("enabled", False)),
+        "period": None if raw_period in (None, "") else int(raw_period),
+        "signal_column": season_cfg.get("signal_column"),
+        "robust": bool(season_cfg.get("robust", True)),
+    }
+
+
 def _feature_frame(
     df,
     dataset: str,
@@ -101,8 +151,15 @@ def _feature_frame(
     cfg: dict,
 ):
     lag_steps = _lag_steps(cfg=cfg, window_size=window_size)
+    fft_cfg = _fft_settings(cfg=cfg)
     if dataset == "nab":
-        feat = build_univariate_features(df[value_col], window=window_size, lag_steps=lag_steps)
+        feat = build_univariate_features(
+            df[value_col],
+            window=window_size,
+            lag_steps=lag_steps,
+            fft_enabled=fft_cfg["enabled"],
+            fft_include_dc=fft_cfg["include_dc"],
+        )
     else:
         exclude = {timestamp_col, label_col, "anomaly", "Label", "changepoint", "is_anomaly"}
         drop_cols = [c for c in exclude if c in df.columns]
@@ -110,6 +167,8 @@ def _feature_frame(
             df.drop(columns=drop_cols, errors="ignore"),
             window=window_size,
             lag_steps=lag_steps,
+            fft_enabled=fft_cfg["enabled"],
+            fft_include_dc=fft_cfg["include_dc"],
         )
     return feat
 
@@ -235,7 +294,13 @@ def _window_end_values(values: np.ndarray, window_size: int, stride: int) -> np.
     return arr[idx]
 
 
-def _stream_feature_vector(window_arr: np.ndarray, dataset: str, lag_steps: list[int] | None = None) -> np.ndarray:
+def _stream_feature_vector(
+    window_arr: np.ndarray,
+    dataset: str,
+    lag_steps: list[int] | None = None,
+    fft_enabled: bool = False,
+    fft_include_dc: bool = False,
+) -> np.ndarray:
     lag_steps = sorted({int(step) for step in (lag_steps or []) if int(step) > 0})
     if dataset == "nab":
         s = window_arr[:, 0]
@@ -243,6 +308,8 @@ def _stream_feature_vector(window_arr: np.ndarray, dataset: str, lag_steps: list
         delta = float(s[-1] - s[-2]) if len(s) > 1 else 0.0
         feats = [float(s[-1]), float(np.mean(s)), std, float(np.median(s)), delta, float(np.min(s)), float(np.max(s))]
         feats.extend(float(s[-1 - lag]) for lag in lag_steps)
+        if fft_enabled:
+            feats.append(float(fft_window_energy(s, include_dc=fft_include_dc)))
         return np.asarray([feats], dtype=float)
 
     feats = []
@@ -252,6 +319,8 @@ def _stream_feature_vector(window_arr: np.ndarray, dataset: str, lag_steps: list
         delta = float(s[-1] - s[-2]) if len(s) > 1 else 0.0
         feats.extend([float(np.mean(s)), std, delta])
         feats.extend(float(s[-1 - lag]) for lag in lag_steps)
+        if fft_enabled:
+            feats.append(float(fft_window_energy(s, include_dc=fft_include_dc)))
     return np.asarray([feats], dtype=float)
 
 
@@ -269,6 +338,172 @@ def _resolve_threshold_calibration(cfg: dict, model_name: str) -> dict:
         "warmup_windows": int(cal_cfg.get("warmup_windows", 0)),
         "suppress_during_warmup": bool(cal_cfg.get("suppress_during_warmup", True)),
     }
+
+
+def _resolve_training_threshold_percentile(cfg: dict, model_name: str) -> float:
+    training_cfg = cfg.get("training", {})
+    default_percentile = float(training_cfg.get("threshold_percentile", 99.5))
+    per_model = training_cfg.get("model_threshold_percentiles", {})
+    if not isinstance(per_model, dict):
+        return default_percentile
+    raw = per_model.get(model_name, default_percentile)
+    return float(raw)
+
+
+def _resolve_advanced_training_settings(cfg: dict, model_name: str) -> dict:
+    adv_cfg = cfg.get("advanced", {})
+    model_cfg = (adv_cfg.get("models") or {}).get(model_name, {})
+    return {
+        "device": str(model_cfg.get("device", adv_cfg.get("device", "cpu"))),
+        "epochs": int(model_cfg.get("epochs", adv_cfg.get("epochs", 8))),
+        "batch_size": int(model_cfg.get("batch_size", adv_cfg.get("batch_size", 128))),
+        "lr": float(model_cfg.get("lr", adv_cfg.get("lr", 1e-3))),
+        "hidden_dim": int(model_cfg.get("hidden_dim", adv_cfg.get("lstm_hidden_dim", 32))),
+    }
+
+
+def _resolve_threshold_search(cfg: dict, model_name: str, current_percentile: float | None = None) -> dict:
+    infer_cfg = cfg.get("inference", {})
+    cal_cfg = infer_cfg.get("threshold_calibration", {})
+    search_cfg = cal_cfg.get("search", {})
+    default_cfg = {
+        "enabled": bool(search_cfg.get("enabled", False)),
+        "optimize_metric": str(search_cfg.get("optimize_metric", "f1")),
+        "prefer_lower_alert_rate": bool(search_cfg.get("prefer_lower_alert_rate", True)),
+        "max_alert_rate": search_cfg.get("max_alert_rate"),
+        "candidate_percentiles": search_cfg.get("default_candidate_percentiles") or [],
+    }
+    model_cfg = (search_cfg.get("models") or {}).get(model_name, {})
+    merged = _deep_merge(default_cfg, model_cfg)
+
+    raw_candidates = merged.get("candidate_percentiles") or []
+    candidates = sorted({float(p) for p in raw_candidates if 0.0 <= float(p) <= 100.0})
+    if not candidates and current_percentile is not None:
+        candidates = [float(current_percentile)]
+
+    max_alert_rate = merged.get("max_alert_rate")
+    return {
+        "enabled": bool(merged.get("enabled", False)),
+        "optimize_metric": str(merged.get("optimize_metric", "f1")),
+        "prefer_lower_alert_rate": bool(merged.get("prefer_lower_alert_rate", True)),
+        "max_alert_rate": None if max_alert_rate in (None, "") else float(max_alert_rate),
+        "candidate_percentiles": candidates,
+    }
+
+
+def _score_summary(scores: np.ndarray) -> dict:
+    arr = np.asarray(scores, dtype=float)
+    if len(arr) == 0:
+        return {"count": 0}
+    return {
+        "count": int(len(arr)),
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+        "p50": float(np.percentile(arr, 50.0)),
+        "p90": float(np.percentile(arr, 90.0)),
+        "p95": float(np.percentile(arr, 95.0)),
+        "p99": float(np.percentile(arr, 99.0)),
+        "p99_5": float(np.percentile(arr, 99.5)),
+    }
+
+
+def _threshold_search_report(
+    *,
+    cfg: dict,
+    model_name: str,
+    scores: np.ndarray,
+    labels: np.ndarray,
+    timestamps: np.ndarray,
+    min_collective: int,
+    current_percentile: float | None,
+) -> dict:
+    cal = _resolve_threshold_calibration(cfg=cfg, model_name=model_name)
+    search = _resolve_threshold_search(cfg=cfg, model_name=model_name, current_percentile=current_percentile)
+    report = {
+        "enabled": bool(search["enabled"]),
+        "status": "disabled" if not search["enabled"] else "pending",
+        "mode": cal["mode"],
+        "warmup_windows": int(cal["warmup_windows"]),
+        "suppressed_windows": int(cal["warmup_windows"]) if cal["suppress_during_warmup"] else 0,
+        "current_percentile": None if current_percentile is None else float(current_percentile),
+        "candidate_percentiles": [float(p) for p in search["candidate_percentiles"]],
+        "optimize_metric": search["optimize_metric"],
+        "prefer_lower_alert_rate": bool(search["prefer_lower_alert_rate"]),
+        "max_alert_rate": search["max_alert_rate"],
+        "rows": [],
+        "recommended": None,
+    }
+    if not search["enabled"]:
+        return report
+    if cal["mode"] != "warmup_percentile":
+        report["status"] = "skipped_mode_not_supported"
+        return report
+
+    arr = np.asarray(scores, dtype=float)
+    y_true = np.asarray(labels, dtype=int)
+    ts = np.asarray(timestamps)
+    warmup = min(int(cal["warmup_windows"]), len(arr))
+    if len(arr) == 0 or len(y_true) != len(arr) or len(ts) != len(arr):
+        report["status"] = "skipped_invalid_inputs"
+        return report
+    if warmup <= 0:
+        report["status"] = "skipped_no_warmup"
+        return report
+
+    true_events = extract_events(y_true, ts, min_collective=min_collective)
+    suppressed = warmup if cal["suppress_during_warmup"] else 0
+    rows = []
+    for percentile in search["candidate_percentiles"]:
+        threshold = float(np.percentile(arr[:warmup], percentile))
+        pred = _binary_predictions(arr, threshold, suppressed_windows=suppressed)
+        pt = point_metrics(y_true, pred)
+        pred_events = extract_events(pred, ts, min_collective=min_collective)
+        evt = event_overlap_metrics(true_events, pred_events)
+        row = {
+            "percentile": float(percentile),
+            "threshold": threshold,
+            "precision": float(pt["precision"]),
+            "recall": float(pt["recall"]),
+            "f1": float(pt["f1"]),
+            "event_f1": None if evt["event_f1"] is None else float(evt["event_f1"]),
+            "alert_count": int(pred.sum()),
+            "alert_rate": float(np.mean(pred)),
+            "pred_event_count": int(len(pred_events)),
+        }
+        rows.append(row)
+
+    if not rows:
+        report["status"] = "skipped_no_candidates"
+        return report
+
+    eligible = rows
+    constraint_applied = False
+    max_alert_rate = search["max_alert_rate"]
+    if max_alert_rate is not None:
+        constrained = [row for row in rows if float(row["alert_rate"]) <= float(max_alert_rate)]
+        if constrained:
+            eligible = constrained
+            constraint_applied = True
+
+    metric_name = search["optimize_metric"]
+    prefer_lower_alert_rate = bool(search["prefer_lower_alert_rate"])
+
+    def _row_sort_key(row: dict) -> tuple[float, float, float]:
+        metric_value = row.get(metric_name)
+        metric_score = float("-inf") if metric_value is None else float(metric_value)
+        alert_component = -float(row["alert_rate"]) if prefer_lower_alert_rate else float(row["alert_rate"])
+        return (metric_score, alert_component, float(row["percentile"]))
+
+    best = max(eligible, key=_row_sort_key)
+    report["rows"] = rows
+    report["recommended"] = {
+        **best,
+        "constraint_applied": constraint_applied,
+    }
+    report["status"] = "ok"
+    return report
 
 
 def _calibrate_threshold_from_scores(
@@ -410,13 +645,26 @@ def _score_stream_window(
     device: str,
 ) -> float:
     lag_steps = _lag_steps(cfg=cfg, window_size=window_arr.shape[0])
+    fft_cfg = _fft_settings(cfg=cfg)
     if model_name == "zscore":
-        feat = _stream_feature_vector(window_arr, dataset, lag_steps=lag_steps)
+        feat = _stream_feature_vector(
+            window_arr,
+            dataset,
+            lag_steps=lag_steps,
+            fft_enabled=fft_cfg["enabled"],
+            fft_include_dc=fft_cfg["include_dc"],
+        )
         x = scaler.transform(feat) if scaler is not None else feat
         return float(score_robust_z(x, z_params)[0])
 
     if model_name == "iforest":
-        feat = _stream_feature_vector(window_arr, dataset, lag_steps=lag_steps)
+        feat = _stream_feature_vector(
+            window_arr,
+            dataset,
+            lag_steps=lag_steps,
+            fft_enabled=fft_cfg["enabled"],
+            fft_include_dc=fft_cfg["include_dc"],
+        )
         x = scaler.transform(feat) if scaler is not None else feat
         return float(-iforest.score_samples(x)[0])
 
@@ -438,7 +686,8 @@ def train_offline(args) -> None:
     bundle = _load_bundle(args=args, cfg=cfg)
 
     window_size = int(cfg.get("training", {}).get("window_size", 60))
-    percentile = float(cfg.get("training", {}).get("threshold_percentile", 99.5))
+    z_percentile = _resolve_training_threshold_percentile(cfg=cfg, model_name="zscore")
+    if_percentile = _resolve_training_threshold_percentile(cfg=cfg, model_name="iforest")
     variant = bundle.variant
     output_dir = _make_output_dir(args.output_dir, args.dataset, variant)
 
@@ -462,12 +711,12 @@ def train_offline(args) -> None:
 
     z_params = fit_robust_baseline(X_train_scaled)
     z_train_scores = score_robust_z(X_train_scaled, z_params)
-    z_threshold = float(np.percentile(z_train_scores, percentile))
+    z_threshold = float(np.percentile(z_train_scores, z_percentile))
 
     iforest = make_iforest(seed=seed)
     iforest.fit(X_train_scaled)
     if_train_scores = -iforest.score_samples(X_train_scaled)
-    if_threshold = float(np.percentile(if_train_scores, percentile))
+    if_threshold = float(np.percentile(if_train_scores, if_percentile))
 
     save_pickle(scaler, str(output_dir / "scaler.pkl"))
     save_pickle(iforest, str(output_dir / "iforest.pkl"))
@@ -475,17 +724,29 @@ def train_offline(args) -> None:
     thresholds_payload = {
         "zscore": z_threshold,
         "iforest": if_threshold,
-        "percentile": percentile,
+        "training_percentiles": {
+            "zscore": z_percentile,
+            "iforest": if_percentile,
+        },
+    }
+    threshold_training_summary = {
+        "zscore": {
+            "artifact_percentile": z_percentile,
+            "artifact_threshold": z_threshold,
+            "train_score_summary": _score_summary(z_train_scores),
+        },
+        "iforest": {
+            "artifact_percentile": if_percentile,
+            "artifact_threshold": if_threshold,
+            "train_score_summary": _score_summary(if_train_scores),
+        },
     }
 
     adv_cfg = cfg.get("advanced", {})
     adv_enabled = bool(adv_cfg.get("enabled", True))
     if adv_enabled:
-        device = str(adv_cfg.get("device", "cpu"))
-        epochs = int(adv_cfg.get("epochs", 8))
-        batch_size = int(adv_cfg.get("batch_size", 128))
-        lr = float(adv_cfg.get("lr", 1e-3))
-        hidden_dim = int(adv_cfg.get("lstm_hidden_dim", 32))
+        lstm_settings = _resolve_advanced_training_settings(cfg=cfg, model_name="lstm_ae")
+        cnn_settings = _resolve_advanced_training_settings(cfg=cfg, model_name="cnn_ae")
 
         adv_train_frame = _advanced_frame(train_pre, bundle.timestamp_col, bundle.label_col)
         raw_train = adv_train_frame.to_numpy(dtype=float)
@@ -497,27 +758,43 @@ def train_offline(args) -> None:
             if len(train_windows):
                 lstm_ae = train_lstm_autoencoder(
                     windows=train_windows,
-                    hidden_dim=hidden_dim,
-                    epochs=epochs,
-                    batch_size=batch_size,
-                    lr=lr,
-                    device=device,
+                    hidden_dim=lstm_settings["hidden_dim"],
+                    epochs=lstm_settings["epochs"],
+                    batch_size=lstm_settings["batch_size"],
+                    lr=lstm_settings["lr"],
+                    device=lstm_settings["device"],
                 )
                 cnn_ae = train_cnn_autoencoder(
                     windows=train_windows,
-                    epochs=epochs,
-                    batch_size=batch_size,
-                    lr=lr,
-                    device=device,
+                    epochs=cnn_settings["epochs"],
+                    batch_size=cnn_settings["batch_size"],
+                    lr=cnn_settings["lr"],
+                    device=cnn_settings["device"],
                 )
 
-                lstm_scores = reconstruction_scores(lstm_ae, train_windows, device=device, model_type="lstm")
-                cnn_scores = reconstruction_scores(cnn_ae, train_windows, device=device, model_type="cnn")
-                lstm_threshold = float(np.percentile(lstm_scores, percentile))
-                cnn_threshold = float(np.percentile(cnn_scores, percentile))
+                lstm_scores = reconstruction_scores(
+                    lstm_ae,
+                    train_windows,
+                    device=lstm_settings["device"],
+                    model_type="lstm",
+                )
+                cnn_scores = reconstruction_scores(
+                    cnn_ae,
+                    train_windows,
+                    device=cnn_settings["device"],
+                    model_type="cnn",
+                )
+                lstm_percentile = _resolve_training_threshold_percentile(cfg=cfg, model_name="lstm_ae")
+                cnn_percentile = _resolve_training_threshold_percentile(cfg=cfg, model_name="cnn_ae")
+                lstm_threshold = float(np.percentile(lstm_scores, lstm_percentile))
+                cnn_threshold = float(np.percentile(cnn_scores, cnn_percentile))
 
                 torch.save(
-                    {"state_dict": lstm_ae.state_dict(), "input_dim": train_windows.shape[-1], "hidden_dim": hidden_dim},
+                    {
+                        "state_dict": lstm_ae.state_dict(),
+                        "input_dim": train_windows.shape[-1],
+                        "hidden_dim": lstm_settings["hidden_dim"],
+                    },
                     output_dir / "lstm_ae.pt",
                 )
                 torch.save(
@@ -528,6 +805,18 @@ def train_offline(args) -> None:
 
                 thresholds_payload["lstm_ae"] = lstm_threshold
                 thresholds_payload["cnn_ae"] = cnn_threshold
+                thresholds_payload["training_percentiles"]["lstm_ae"] = lstm_percentile
+                thresholds_payload["training_percentiles"]["cnn_ae"] = cnn_percentile
+                threshold_training_summary["lstm_ae"] = {
+                    "artifact_percentile": lstm_percentile,
+                    "artifact_threshold": lstm_threshold,
+                    "train_score_summary": _score_summary(lstm_scores),
+                }
+                threshold_training_summary["cnn_ae"] = {
+                    "artifact_percentile": cnn_percentile,
+                    "artifact_threshold": cnn_threshold,
+                    "train_score_summary": _score_summary(cnn_scores),
+                }
 
     save_json(
         thresholds_payload,
@@ -544,6 +833,7 @@ def train_offline(args) -> None:
             "feature_columns": list(train_feat.columns),
             "advanced_enabled": adv_enabled,
             "advanced_feature_columns": list(adv_train_frame.columns) if adv_enabled else [],
+            "threshold_training_summary": threshold_training_summary,
         },
         str(output_dir / "metadata.json"),
     )
@@ -619,9 +909,39 @@ def evaluate_offline(args) -> None:
     if_pred = _binary_predictions(if_scores, if_threshold, suppressed_windows=if_suppressed)
 
     min_collective = int(cfg.get("inference", {}).get("alert_min_segment_length", 3))
+    interpretation_cfg = cfg.get("interpretation", {})
+    interpretation_enabled = bool(interpretation_cfg.get("enabled", True))
+    drift_min_length = int(interpretation_cfg.get("drift_min_length", 120))
+    drift_length_ratio = float(interpretation_cfg.get("drift_length_ratio", 0.25))
+    nonstationarity_cfg = cfg.get("nonstationarity", {})
+    nonstationarity_enabled = bool(nonstationarity_cfg.get("enabled", True))
+    nonstationarity_segment_count = int(nonstationarity_cfg.get("segment_count", 3))
     true_events = extract_events(y_true, ts, min_collective=min_collective)
     z_events = extract_events(z_pred, ts, min_collective=min_collective)
     if_events = extract_events(if_pred, ts, min_collective=min_collective)
+    if interpretation_enabled:
+        true_events_interpreted = interpret_events(
+            true_events,
+            total_points=len(y_true),
+            drift_min_length=drift_min_length,
+            drift_length_ratio=drift_length_ratio,
+        )
+        z_events_interpreted = interpret_events(
+            z_events,
+            total_points=len(y_true),
+            drift_min_length=drift_min_length,
+            drift_length_ratio=drift_length_ratio,
+        )
+        if_events_interpreted = interpret_events(
+            if_events,
+            total_points=len(y_true),
+            drift_min_length=drift_min_length,
+            drift_length_ratio=drift_length_ratio,
+        )
+    else:
+        true_events_interpreted = true_events
+        z_events_interpreted = z_events
+        if_events_interpreted = if_events
 
     z_metrics = point_metrics(y_true, z_pred)
     if_metrics = point_metrics(y_true, if_pred)
@@ -631,10 +951,53 @@ def evaluate_offline(args) -> None:
     if_event_metrics = event_overlap_metrics(true_events, if_events)
     z_cm = confusion_matrix(y_true, z_pred, labels=[0, 1]).tolist()
     if_cm = confusion_matrix(y_true, if_pred, labels=[0, 1]).tolist()
+    z_search = _threshold_search_report(
+        cfg=cfg,
+        model_name="zscore",
+        scores=z_scores,
+        labels=y_true,
+        timestamps=ts,
+        min_collective=min_collective,
+        current_percentile=_resolve_threshold_calibration(cfg=cfg, model_name="zscore")["percentile"],
+    )
+    if_search = _threshold_search_report(
+        cfg=cfg,
+        model_name="iforest",
+        scores=if_scores,
+        labels=y_true,
+        timestamps=ts,
+        min_collective=min_collective,
+        current_percentile=_resolve_threshold_calibration(cfg=cfg, model_name="iforest")["percentile"],
+    )
 
     save_json(true_events, str(report_dir / "events_true.json"))
     save_json(z_events, str(report_dir / "events_zscore.json"))
     save_json(if_events, str(report_dir / "events_iforest.json"))
+    save_json(true_events_interpreted, str(report_dir / "interpreted_events_true.json"))
+    save_json(z_events_interpreted, str(report_dir / "interpreted_events_zscore.json"))
+    save_json(if_events_interpreted, str(report_dir / "interpreted_events_iforest.json"))
+
+    z_feature_scores = featurewise_robust_z(X_test_scaled, z_params)
+    z_explanations = explain_zscore_events(
+        events=z_events,
+        scores=z_scores,
+        feature_z=z_feature_scores,
+        raw_feature_values=X_test,
+        feature_names=feature_columns,
+        timestamps=ts,
+        threshold=z_threshold,
+    )
+    if_explanations = explain_iforest_events(
+        events=if_events,
+        scores=if_scores,
+        scaled_feature_values=X_test_scaled,
+        raw_feature_values=X_test,
+        feature_names=feature_columns,
+        timestamps=ts,
+        threshold=if_threshold,
+    )
+    save_json(z_explanations, str(report_dir / "explanations_zscore.json"))
+    save_json(if_explanations, str(report_dir / "explanations_iforest.json"))
 
     metrics_payload = {
         "dataset": args.dataset,
@@ -643,10 +1006,17 @@ def evaluate_offline(args) -> None:
         "ground_truth": {
             "event_count": len(true_events),
             "event_type_counts": event_type_counts(true_events),
+            "operational_interpretation_counts": interpretation_counts(true_events_interpreted),
         },
         "zscore": {
             "threshold": z_threshold,
             "threshold_calibration": z_cal,
+            "score_summary": _score_summary(z_scores),
+            "training_threshold": metadata.get("threshold_training_summary", {}).get("zscore"),
+            "threshold_search": z_search,
+            "explanation_file": "explanations_zscore.json",
+            "operational_interpretation_file": "interpreted_events_zscore.json",
+            "operational_interpretation_counts": interpretation_counts(z_events_interpreted),
             **z_metrics,
             **z_rank_metrics,
             **z_event_metrics,
@@ -657,6 +1027,12 @@ def evaluate_offline(args) -> None:
         "iforest": {
             "threshold": if_threshold,
             "threshold_calibration": if_cal,
+            "score_summary": _score_summary(if_scores),
+            "training_threshold": metadata.get("threshold_training_summary", {}).get("iforest"),
+            "threshold_search": if_search,
+            "explanation_file": "explanations_iforest.json",
+            "operational_interpretation_file": "interpreted_events_iforest.json",
+            "operational_interpretation_counts": interpretation_counts(if_events_interpreted),
             **if_metrics,
             **if_rank_metrics,
             **if_event_metrics,
@@ -682,8 +1058,44 @@ def evaluate_offline(args) -> None:
     seq_scaler_path = artifact_dir / "seq_scaler.pkl"
     stride = int(cfg.get("training", {}).get("stride", 1))
     adv_rows = None
+    interpreted_events_by_model = {
+        "ground_truth": true_events_interpreted,
+        "zscore": z_events_interpreted,
+        "iforest": if_events_interpreted,
+    }
+    nonstationarity_reports = {}
+    if nonstationarity_enabled:
+        nonstationarity_reports["zscore"] = build_nonstationarity_report(
+            model_name="zscore",
+            scores=z_scores,
+            labels=y_true,
+            timestamps=ts,
+            artifact_threshold=float(thresholds["zscore"]),
+            calibrated_threshold=z_threshold,
+            calibrated_suppressed_windows=z_suppressed,
+            min_collective=min_collective,
+            training_threshold_summary=metadata.get("threshold_training_summary", {}).get("zscore"),
+            warmup_windows=int(z_cal.get("warmup_windows", 0)),
+            segment_count=nonstationarity_segment_count,
+        )
+        nonstationarity_reports["iforest"] = build_nonstationarity_report(
+            model_name="iforest",
+            scores=if_scores,
+            labels=y_true,
+            timestamps=ts,
+            artifact_threshold=float(thresholds["iforest"]),
+            calibrated_threshold=if_threshold,
+            calibrated_suppressed_windows=if_suppressed,
+            min_collective=min_collective,
+            training_threshold_summary=metadata.get("threshold_training_summary", {}).get("iforest"),
+            warmup_windows=int(if_cal.get("warmup_windows", 0)),
+            segment_count=nonstationarity_segment_count,
+        )
     if seq_scaler_path.exists():
         adv_columns = metadata.get("advanced_feature_columns") or None
+        adv_channel_names = adv_columns or list(
+            _advanced_frame(test_pre, bundle.timestamp_col, bundle.label_col).columns
+        )
         seq_scaler = load_pickle(str(seq_scaler_path))
         raw_test = _advanced_matrix(
             test_pre,
@@ -735,6 +1147,8 @@ def evaluate_offline(args) -> None:
                     metrics_payload[model_name] = {
                         "threshold": adv_threshold,
                         "threshold_calibration": adv_cal,
+                        "score_summary": _score_summary(adv_scores),
+                        "training_threshold": metadata.get("threshold_training_summary", {}).get(model_name),
                         **adv_metrics,
                         **adv_rank_metrics,
                         **adv_event_metrics,
@@ -742,7 +1156,61 @@ def evaluate_offline(args) -> None:
                         "pred_event_type_counts": event_type_counts(adv_events),
                         "confusion_matrix": adv_cm,
                     }
+                    metrics_payload[model_name]["threshold_search"] = _threshold_search_report(
+                        cfg=cfg,
+                        model_name=model_name,
+                        scores=adv_scores,
+                        labels=y_true_adv,
+                        timestamps=ts_adv,
+                        min_collective=min_collective,
+                        current_percentile=_resolve_threshold_calibration(cfg=cfg, model_name=model_name)["percentile"],
+                    )
+                    breakdown = reconstruction_error_breakdown(model, test_windows, device=device, model_type=model_type)
+                    adv_explanations = explain_autoencoder_events(
+                        events=adv_events,
+                        scores=adv_scores,
+                        channel_error=breakdown["channel_error"],
+                        timestep_error=breakdown["timestep_error"],
+                        channel_names=adv_channel_names,
+                        timestamps=ts_adv,
+                        threshold=adv_threshold,
+                        model_name=model_name,
+                        window_size=window_size,
+                    )
+                    explanation_file = f"explanations_{model_name}.json"
+                    save_json(adv_explanations, str(report_dir / explanation_file))
+                    metrics_payload[model_name]["explanation_file"] = explanation_file
                     save_json(adv_events, str(report_dir / f"events_{model_name}.json"))
+                    if interpretation_enabled:
+                        adv_events_interpreted = interpret_events(
+                            adv_events,
+                            total_points=len(y_true_adv),
+                            drift_min_length=drift_min_length,
+                            drift_length_ratio=drift_length_ratio,
+                        )
+                    else:
+                        adv_events_interpreted = adv_events
+                    interpreted_file = f"interpreted_events_{model_name}.json"
+                    save_json(adv_events_interpreted, str(report_dir / interpreted_file))
+                    interpreted_events_by_model[model_name] = adv_events_interpreted
+                    metrics_payload[model_name]["operational_interpretation_file"] = interpreted_file
+                    metrics_payload[model_name]["operational_interpretation_counts"] = interpretation_counts(
+                        adv_events_interpreted
+                    )
+                    if nonstationarity_enabled:
+                        nonstationarity_reports[model_name] = build_nonstationarity_report(
+                            model_name=model_name,
+                            scores=adv_scores,
+                            labels=y_true_adv,
+                            timestamps=ts_adv,
+                            artifact_threshold=float(thresholds[model_name]),
+                            calibrated_threshold=adv_threshold,
+                            calibrated_suppressed_windows=adv_suppressed,
+                            min_collective=min_collective,
+                            training_threshold_summary=metadata.get("threshold_training_summary", {}).get(model_name),
+                            warmup_windows=int(adv_cal.get("warmup_windows", 0)),
+                            segment_count=nonstationarity_segment_count,
+                        )
 
                     adv_rows[f"{model_name}_score"] = adv_scores
                     adv_rows[f"{model_name}_pred"] = adv_pred
@@ -764,6 +1232,42 @@ def evaluate_offline(args) -> None:
                     )
     if adv_rows:
         pd.DataFrame(adv_rows).to_csv(report_dir / "advanced_predictions.csv", index=False)
+
+    seasonality_cfg = _seasonality_settings(cfg=cfg)
+    seasonality_summary = run_stl_seasonality_analysis(
+        df=test_pre,
+        timestamp_col=bundle.timestamp_col,
+        label_col=bundle.label_col,
+        report_dir=report_dir,
+        dataset=args.dataset,
+        variant=variant,
+        period=seasonality_cfg["period"],
+        enabled=seasonality_cfg["enabled"],
+        robust=seasonality_cfg["robust"],
+        preferred_columns=[seasonality_cfg["signal_column"], bundle.value_col],
+    )
+    metrics_payload["seasonality_analysis"] = seasonality_summary
+    save_json(seasonality_summary, str(report_dir / "seasonality_summary.json"))
+    threshold_strategy_payload = {
+        model_name: payload
+        for model_name, payload in metrics_payload.items()
+        if model_name in {"zscore", "iforest", "lstm_ae", "cnn_ae"}
+    }
+    save_json(threshold_strategy_payload, str(report_dir / "threshold_strategy.json"))
+    explainability_summary = save_model_comparison_summary(report_dir=report_dir, metrics_payload=metrics_payload)
+    metrics_payload["explainability_summary"] = explainability_summary
+    operational_summary = save_operational_interpretation_summary(
+        report_dir=report_dir,
+        interpreted_by_model=interpreted_events_by_model,
+    )
+    metrics_payload["operational_interpretation_summary"] = operational_summary
+    if nonstationarity_enabled:
+        save_json(nonstationarity_reports, str(report_dir / "nonstationarity_summary.json"))
+        nonstationarity_summary = save_nonstationarity_summary(
+            report_dir=report_dir,
+            report_by_model=nonstationarity_reports,
+        )
+        metrics_payload["nonstationarity_summary"] = nonstationarity_summary
 
     save_json(metrics_payload, str(report_dir / "metrics.json"))
 

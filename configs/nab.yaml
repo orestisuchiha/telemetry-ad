@@ -2,6 +2,13 @@ dataset: nab
 dataset_root: Datasets/NAB/realAWSCloudwatch/realAWSCloudwatch
 training:
   threshold_percentile: 99.9
+  model_threshold_percentiles:
+    iforest: 99.0
+  train_ratio: 0.7
+  split_strategy: anomaly_aware
+  test_normal_prefix_points: 120
+  min_train_points: 600
+  drop_labeled_anomalies_from_train: true
 series:
   - ec2_cpu_utilization_5f5533
   - rds_cpu_utilization_cc0c53
@@ -14,3 +21,32 @@ default_model_set:
   - iforest
   - lstm_ae
   - cnn_ae
+
+feature_engineering:
+  seasonality_analysis:
+    period: 288
+    signal_column: value
+
+preprocessing:
+  rolling_detrend_window: 144
+
+advanced:
+  models:
+    lstm_ae:
+      epochs: 16
+
+inference:
+  threshold_calibration:
+    enabled: true
+    warmup_windows: 120
+    suppress_during_warmup: true
+    default:
+      mode: artifact
+      percentile: 99.5
+    search:
+      enabled: false
+      optimize_metric: f1
+      prefer_lower_alert_rate: true
+      default_candidate_percentiles: []
+      models: {}
+    models: {}

@@ -15,6 +15,11 @@ default_model_set:
   - lstm_ae
   - cnn_ae
 
+feature_engineering:
+  seasonality_analysis:
+    period: 60
+    signal_column: Pressure
+
 inference:
   threshold_calibration:
     enabled: true
@@ -23,6 +28,47 @@ inference:
     default:
       mode: artifact
       percentile: 99.5
+    search:
+      enabled: true
+      optimize_metric: f1
+      prefer_lower_alert_rate: true
+      default_candidate_percentiles: []
+      models:
+        zscore:
+          candidate_percentiles:
+            - 10.0
+            - 15.0
+            - 20.0
+            - 25.0
+            - 30.0
+            - 40.0
+            - 50.0
+        iforest:
+          candidate_percentiles:
+            - 40.0
+            - 45.0
+            - 50.0
+            - 55.0
+            - 60.0
+          max_alert_rate: 0.40
+        lstm_ae:
+          candidate_percentiles:
+            - 70.0
+            - 75.0
+            - 80.0
+            - 85.0
+            - 90.0
+            - 95.0
+          max_alert_rate: 0.50
+        cnn_ae:
+          candidate_percentiles:
+            - 60.0
+            - 65.0
+            - 70.0
+            - 75.0
+            - 80.0
+            - 85.0
+          max_alert_rate: 0.50
     models:
       zscore:
         mode: warmup_percentile
@@ -32,7 +78,7 @@ inference:
         percentile: 50.0
       lstm_ae:
         mode: warmup_percentile
-        percentile: 75.0
+        percentile: 80.0
       cnn_ae:
         mode: warmup_percentile
-        percentile: 60.0
+        percentile: 70.0
