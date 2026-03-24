@@ -1,97 +1,158 @@
 # telemetry-ad
 
-Project for Anomaly Detection on Time-Series telemetry
+End-to-end anomaly detection pipeline for time-series telemetry using NAB and SKAB.
+
+## Current Status
+- Offline training and evaluation are implemented for 4 models.
+- Local end-to-end API-backed streaming has been validated.
+- Raspberry Pi deployment scripts and API pull-mode support are included.
+- Real hardware validation on the Raspberry Pi is still pending.
 
 ## Scope
-- Datasets: NAB realAWSCloudwatch and SKAB
-- Offline: training/evaluation in Docker or local machine
-- Online: sliding-window streaming inference on Raspberry Pi 5
-- Models: 2 baselines + 2 advanced
+- Datasets:
+  - NAB `realAWSCloudwatch`
+  - SKAB
+- Offline stage:
+  - training
+  - evaluation
+  - plots and metrics
+- Online stage:
+  - sliding-window inference
+  - local replay or API-backed streaming
+  - Raspberry Pi deployment path
+- Models:
+  - `zscore`
+  - `iforest`
+  - `lstm_ae`
+  - `cnn_ae`
 
-## Current dataset mapping
+## Dataset Mapping
 - NAB root: `Datasets/NAB/realAWSCloudwatch/realAWSCloudwatch`
+- NAB labels: `Datasets/NAB/labels/combined_windows.json`
 - SKAB train: `Datasets/SKAB/anomaly-free/anomaly-free.csv`
 - SKAB test: `Datasets/SKAB/valve1/1.csv`
 
-## Project layout
+## Project Layout
 ```text
 telemetry-ad/
   Datasets/
   configs/
-  src/telemetry_ad/
+  docs/
   scripts/
+  src/telemetry_ad/
   artifacts/
   reports/
   logs/
 ```
 
-## Minimal run commands
+## Setup
+Install the main dependencies and the API extras:
+
+```bash
+pip install -r requirements.txt
+pip install -r requirements-api.txt
+```
+
+## Quickstart
+
+### SKAB: train and evaluate
+```bash
+python scripts/train_offline.py --dataset skab --split anomalyfree_vs_valve1_1
+python scripts/evaluate_offline.py --dataset skab --split anomalyfree_vs_valve1_1
+```
+
+### SKAB: local streaming replay
+```bash
+python scripts/infer_stream_pi.py --dataset skab --split anomalyfree_vs_valve1_1 --model iforest --source local --log-file logs/stream_iforest_local.csv
+```
+
+### SKAB: API-backed streaming
+In one terminal:
+
+```bash
+python scripts/serve_stream_api.py --dataset skab --split anomalyfree_vs_valve1_1 --host 127.0.0.1 --port 8000
+```
+
+In another terminal:
+
+```bash
+python scripts/infer_stream_pi.py --dataset skab --split anomalyfree_vs_valve1_1 --model iforest --source api --api-base-url http://127.0.0.1:8000 --api-batch-size 32 --log-file logs/stream_iforest_api.csv
+```
+
+### NAB example
 ```bash
 python scripts/train_offline.py --dataset nab --series ec2_cpu_utilization_5f5533
-python scripts/train_offline.py --dataset skab --split anomalyfree_vs_valve1_1
 python scripts/evaluate_offline.py --dataset nab --series ec2_cpu_utilization_5f5533
-python scripts/infer_stream_pi.py --dataset skab --split anomalyfree_vs_valve1_1 --model lstm_ae --source local
 ```
 
-## Person B model outputs
-- Offline training now exports advanced artifacts when `advanced.enabled=true` in config:
-  - `lstm_ae.pt`
-  - `cnn_ae.pt`
-  - `seq_scaler.pkl`
-  - thresholds for `lstm_ae` and `cnn_ae` in `thresholds.json`
-- Offline evaluation now reports advanced model metrics and plots when artifacts are available.
-- Streaming inference supports all models: `zscore`, `iforest`, `lstm_ae`, `cnn_ae`.
-- SKAB can optionally recalibrate thresholds from a startup warmup window to reduce train-to-stream score shift, with per-model settings in `configs/skab.yaml`.
+## Streaming Modes
+`scripts/infer_stream_pi.py` supports:
+- `--source local`
+  Replays the configured test split directly from local files.
+- `--source api`
+  Pulls telemetry batches from `GET /stream/next`.
 
-## Docker examples (Person B)
-```bash
-# Train + evaluate SKAB with advanced models
-docker build -t telemetry-ad .
-docker run --rm -v ${PWD}:/app telemetry-ad python scripts/train_offline.py --dataset skab --split anomalyfree_vs_valve1_1
-docker run --rm -v ${PWD}:/app telemetry-ad python scripts/evaluate_offline.py --dataset skab --split anomalyfree_vs_valve1_1
+Alert logs are written as CSV with:
+- `timestamp`
+- `model`
+- `score`
+- `threshold`
 
-# Simulate Raspberry Pi streaming inference
-docker run --rm -v ${PWD}:/app telemetry-ad python scripts/infer_stream_pi.py --dataset skab --split anomalyfree_vs_valve1_1 --model lstm_ae --source local --log-file logs/stream_lstm.csv
-```
-
-## FastAPI stream server (for Pi pull mode)
-```bash
-# Install API dependencies once
-pip install -r requirements-api.txt
-
-# Serve telemetry points from test split
-python scripts/serve_stream_api.py --dataset skab --split anomalyfree_vs_valve1_1 --host 0.0.0.0 --port 8000
-
-# Pi/client consumes batches from the API instead of a local dataset file
-python scripts/infer_stream_pi.py --dataset skab --split anomalyfree_vs_valve1_1 --model lstm_ae --source api --api-base-url http://127.0.0.1:8000 --api-batch-size 32 --log-file logs/stream_lstm_api.csv
-```
-
-Endpoints:
+## FastAPI Endpoints
 - `GET /health`
 - `GET /stream/next?cursor=0&batch_size=1`
 
-`infer_stream_pi.py` now supports two streaming modes:
-- `--source local`: replay the configured test split locally on the Pi
-- `--source api`: pull telemetry batches from the FastAPI stream server
-
-## Raspberry Pi quickstart
+## Docker Examples
 ```bash
-# after cloning this repo on Pi
-bash scripts/pi_setup.sh
-source .venv/bin/activate
+docker build -t telemetry-ad .
 
-# verify local setup + API connectivity over Tailscale
-python scripts/pi_preflight.py --api-base-url http://<tailscale-host-or-ip>:8000
-
-# run API-backed inference from the Pi
-python scripts/infer_stream_pi.py --dataset skab --split anomalyfree_vs_valve1_1 --model lstm_ae --source api --api-base-url http://<tailscale-host-or-ip>:8000 --api-batch-size 32 --log-file logs/pi_stream_lstm.csv
+docker run --rm -v ${PWD}:/app telemetry-ad python scripts/train_offline.py --dataset skab --split anomalyfree_vs_valve1_1
+docker run --rm -v ${PWD}:/app telemetry-ad python scripts/evaluate_offline.py --dataset skab --split anomalyfree_vs_valve1_1
+docker run --rm -v ${PWD}:/app telemetry-ad python scripts/infer_stream_pi.py --dataset skab --split anomalyfree_vs_valve1_1 --model iforest --source local --log-file logs/stream_iforest_local.csv
 ```
 
-Detailed deployment checklist:
+## Raspberry Pi Quickstart
+After cloning the repo on the Pi:
+
+```bash
+bash scripts/pi_setup.sh
+source .venv/bin/activate
+python scripts/pi_preflight.py --api-base-url http://<tailscale-host-or-ip>:8000
+python scripts/infer_stream_pi.py --dataset skab --split anomalyfree_vs_valve1_1 --model iforest --source api --api-base-url http://<tailscale-host-or-ip>:8000 --api-batch-size 32 --log-file logs/pi_stream_iforest.csv
+```
+
+Detailed checklist:
 - `docs/PI_DEPLOYMENT_PLAN.md`
 
-## Notes
-- SKAB CSV files are semicolon-delimited (`sep=';'`).
-- Preprocessing options in `configs/base.yaml` now support configurable forward fill and interpolation (`interpolate: false|true|linear|time`).
-- Keep training offline; copy only required artifacts to Pi for inference.
-- If NAB labels are unavailable locally, use weak/operational evaluation mode.
+## Configuration Notes
+
+### Preprocessing
+`configs/base.yaml` supports:
+- `resample_rule`
+- `forward_fill`
+- `interpolate`
+- `interpolate_limit_direction`
+- `ewma_alpha`
+- `standardize`
+
+### Feature Engineering
+Baseline feature engineering supports configurable lag embeddings through:
+- `feature_engineering.lag_steps`
+
+Current defaults:
+- `1`
+- `5`
+- `10`
+
+### Threshold Calibration
+The pipeline supports:
+- artifact thresholds learned offline
+- warmup-percentile recalibration on the target stream
+
+SKAB currently uses model-specific warmup calibration in `configs/skab.yaml` to reduce train-to-stream score shift.
+
+## Important Notes
+- SKAB CSV files are semicolon-delimited.
+- Offline artifacts must be regenerated after changing preprocessing or feature-engineering settings.
+- Keep training offline; copy only the required artifacts to the Raspberry Pi for inference.
+- If NAB labels are unavailable locally, use weak or operational evaluation mode.

@@ -82,12 +82,35 @@ def _prepare_split(df, timestamp_col: str, label_col: str, cfg: dict):
     )
 
 
-def _feature_frame(df, dataset: str, value_col: str | None, label_col: str, timestamp_col: str, window_size: int):
+def _lag_steps(cfg: dict, window_size: int) -> list[int]:
+    feat_cfg = cfg.get("feature_engineering", {})
+    raw_steps = feat_cfg.get("lag_steps") or []
+    steps = sorted({int(step) for step in raw_steps if int(step) > 0})
+    if steps and max(steps) >= window_size:
+        raise ValueError("feature_engineering.lag_steps must be smaller than training.window_size")
+    return steps
+
+
+def _feature_frame(
+    df,
+    dataset: str,
+    value_col: str | None,
+    label_col: str,
+    timestamp_col: str,
+    window_size: int,
+    cfg: dict,
+):
+    lag_steps = _lag_steps(cfg=cfg, window_size=window_size)
     if dataset == "nab":
-        feat = build_univariate_features(df[value_col], window=window_size)
+        feat = build_univariate_features(df[value_col], window=window_size, lag_steps=lag_steps)
     else:
-        drop_cols = [c for c in (timestamp_col, label_col) if c in df.columns]
-        feat = build_multivariate_features(df.drop(columns=drop_cols, errors="ignore"), window=window_size)
+        exclude = {timestamp_col, label_col, "anomaly", "Label", "changepoint", "is_anomaly"}
+        drop_cols = [c for c in exclude if c in df.columns]
+        feat = build_multivariate_features(
+            df.drop(columns=drop_cols, errors="ignore"),
+            window=window_size,
+            lag_steps=lag_steps,
+        )
     return feat
 
 
@@ -212,12 +235,15 @@ def _window_end_values(values: np.ndarray, window_size: int, stride: int) -> np.
     return arr[idx]
 
 
-def _stream_feature_vector(window_arr: np.ndarray, dataset: str) -> np.ndarray:
+def _stream_feature_vector(window_arr: np.ndarray, dataset: str, lag_steps: list[int] | None = None) -> np.ndarray:
+    lag_steps = sorted({int(step) for step in (lag_steps or []) if int(step) > 0})
     if dataset == "nab":
         s = window_arr[:, 0]
         std = float(np.std(s, ddof=1)) if len(s) > 1 else 0.0
         delta = float(s[-1] - s[-2]) if len(s) > 1 else 0.0
-        return np.asarray([[s[-1], np.mean(s), std, np.median(s), delta, np.min(s), np.max(s)]], dtype=float)
+        feats = [float(s[-1]), float(np.mean(s)), std, float(np.median(s)), delta, float(np.min(s)), float(np.max(s))]
+        feats.extend(float(s[-1 - lag]) for lag in lag_steps)
+        return np.asarray([feats], dtype=float)
 
     feats = []
     for c in range(window_arr.shape[1]):
@@ -225,6 +251,7 @@ def _stream_feature_vector(window_arr: np.ndarray, dataset: str) -> np.ndarray:
         std = float(np.std(s, ddof=1)) if len(s) > 1 else 0.0
         delta = float(s[-1] - s[-2]) if len(s) > 1 else 0.0
         feats.extend([float(np.mean(s)), std, delta])
+        feats.extend(float(s[-1 - lag]) for lag in lag_steps)
     return np.asarray([feats], dtype=float)
 
 
@@ -374,6 +401,7 @@ def _score_stream_window(
     model_name: str,
     dataset: str,
     window_arr: np.ndarray,
+    cfg: dict,
     scaler,
     z_params,
     iforest,
@@ -381,13 +409,14 @@ def _score_stream_window(
     ae_model,
     device: str,
 ) -> float:
+    lag_steps = _lag_steps(cfg=cfg, window_size=window_arr.shape[0])
     if model_name == "zscore":
-        feat = _stream_feature_vector(window_arr, dataset)
+        feat = _stream_feature_vector(window_arr, dataset, lag_steps=lag_steps)
         x = scaler.transform(feat) if scaler is not None else feat
         return float(score_robust_z(x, z_params)[0])
 
     if model_name == "iforest":
-        feat = _stream_feature_vector(window_arr, dataset)
+        feat = _stream_feature_vector(window_arr, dataset, lag_steps=lag_steps)
         x = scaler.transform(feat) if scaler is not None else feat
         return float(-iforest.score_samples(x)[0])
 
@@ -421,6 +450,7 @@ def train_offline(args) -> None:
         label_col=bundle.label_col,
         timestamp_col=bundle.timestamp_col,
         window_size=window_size,
+        cfg=cfg,
     )
     if train_feat.empty:
         raise ValueError("Training feature frame is empty. Lower window_size or check preprocessing.")
@@ -549,6 +579,7 @@ def evaluate_offline(args) -> None:
         label_col=bundle.label_col,
         timestamp_col=bundle.timestamp_col,
         window_size=window_size,
+        cfg=cfg,
     )
     if test_feat.empty:
         raise ValueError("Test feature frame is empty. Lower window_size or check preprocessing.")
@@ -851,6 +882,7 @@ def infer_stream_pi(args) -> None:
             model_name=args.model,
             dataset=args.dataset,
             window_arr=win,
+            cfg=cfg,
             scaler=scaler,
             z_params=z_params,
             iforest=iforest,

@@ -26,9 +26,10 @@ inference:
     models:
       zscore:
         mode: warmup_percentile
-        percentile: 99.5
+        percentile: 10.0
       iforest:
-        mode: artifact
+        mode: warmup_percentile
+        percentile: 50.0
       lstm_ae:
         mode: warmup_percentile
         percentile: 75.0

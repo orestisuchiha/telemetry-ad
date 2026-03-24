@@ -23,6 +23,12 @@ preprocessing:
   ewma_alpha: null
   standardize: true
 
+feature_engineering:
+  lag_steps:
+    - 1
+    - 5
+    - 10
+
 inference:
   alert_min_segment_length: 3
   threshold_calibration:
