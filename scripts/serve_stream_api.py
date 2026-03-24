@@ -55,6 +55,9 @@ def _load_test_frame(dataset: str, series: str | None, split: str | None, config
         df=bundle.test_df,
         timestamp_col=bundle.timestamp_col,
         resample_rule=pre_cfg.get("resample_rule"),
+        forward_fill=bool(pre_cfg.get("forward_fill", True)),
+        interpolate=pre_cfg.get("interpolate"),
+        interpolate_limit_direction=str(pre_cfg.get("interpolate_limit_direction", "both")),
         ewma_alpha=pre_cfg.get("ewma_alpha"),
         exclude_cols=[bundle.label_col],
     )

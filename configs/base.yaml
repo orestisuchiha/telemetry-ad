@@ -19,8 +19,17 @@ preprocessing:
   resample_rule: null
   forward_fill: true
   interpolate: false
+  interpolate_limit_direction: both
   ewma_alpha: null
   standardize: true
 
 inference:
   alert_min_segment_length: 3
+  threshold_calibration:
+    enabled: false
+    warmup_windows: 0
+    suppress_during_warmup: true
+    default:
+      mode: artifact
+      percentile: 99.5
+    models: {}

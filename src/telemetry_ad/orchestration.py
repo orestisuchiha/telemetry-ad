@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 import matplotlib
 matplotlib.use("Agg")
@@ -72,6 +74,9 @@ def _prepare_split(df, timestamp_col: str, label_col: str, cfg: dict):
         df=df,
         timestamp_col=timestamp_col,
         resample_rule=pre.get("resample_rule"),
+        forward_fill=bool(pre.get("forward_fill", True)),
+        interpolate=pre.get("interpolate"),
+        interpolate_limit_direction=str(pre.get("interpolate_limit_direction", "both")),
         ewma_alpha=pre.get("ewma_alpha"),
         exclude_cols=[label_col],
     )
@@ -221,6 +226,180 @@ def _stream_feature_vector(window_arr: np.ndarray, dataset: str) -> np.ndarray:
         delta = float(s[-1] - s[-2]) if len(s) > 1 else 0.0
         feats.extend([float(np.mean(s)), std, delta])
     return np.asarray([feats], dtype=float)
+
+
+def _resolve_threshold_calibration(cfg: dict, model_name: str) -> dict:
+    infer_cfg = cfg.get("inference", {})
+    cal_cfg = infer_cfg.get("threshold_calibration", {})
+    enabled = bool(cal_cfg.get("enabled", False))
+    default_cfg = cal_cfg.get("default", {})
+    model_cfg = (cal_cfg.get("models") or {}).get(model_name, {})
+    merged = _deep_merge(default_cfg, model_cfg)
+    return {
+        "enabled": enabled,
+        "mode": str(merged.get("mode", "artifact")),
+        "percentile": float(merged.get("percentile", 99.5)),
+        "warmup_windows": int(cal_cfg.get("warmup_windows", 0)),
+        "suppress_during_warmup": bool(cal_cfg.get("suppress_during_warmup", True)),
+    }
+
+
+def _calibrate_threshold_from_scores(
+    scores: np.ndarray,
+    base_threshold: float,
+    cfg: dict,
+    model_name: str,
+) -> tuple[float, int, dict]:
+    cal = _resolve_threshold_calibration(cfg=cfg, model_name=model_name)
+    payload = {
+        "enabled": cal["enabled"],
+        "mode": cal["mode"],
+        "base_threshold": float(base_threshold),
+        "effective_threshold": float(base_threshold),
+        "percentile": None if cal["mode"] == "artifact" else float(cal["percentile"]),
+        "warmup_windows": 0,
+        "suppressed_windows": 0,
+    }
+    if not cal["enabled"] or cal["mode"] == "artifact":
+        return float(base_threshold), 0, payload
+
+    arr = np.asarray(scores, dtype=float)
+    if len(arr) == 0:
+        return float(base_threshold), 0, payload
+
+    warmup = min(int(cal["warmup_windows"]), len(arr))
+    if warmup <= 0:
+        return float(base_threshold), 0, payload
+
+    threshold = float(np.percentile(arr[:warmup], cal["percentile"]))
+    suppressed = warmup if cal["suppress_during_warmup"] else 0
+    payload.update(
+        {
+            "effective_threshold": threshold,
+            "warmup_windows": warmup,
+            "suppressed_windows": suppressed,
+        }
+    )
+    return threshold, suppressed, payload
+
+
+def _binary_predictions(scores: np.ndarray, threshold: float, suppressed_windows: int = 0) -> np.ndarray:
+    pred = (np.asarray(scores, dtype=float) > float(threshold)).astype(int)
+    if suppressed_windows > 0:
+        pred[:suppressed_windows] = 0
+    return pred
+
+
+def _resolve_variant(args, cfg: dict) -> str:
+    if args.dataset == "nab":
+        series = args.series or (cfg.get("series") or [None])[0]
+        if not series:
+            raise ValueError("NAB requires --series or configs/nab.yaml series entry")
+        return series
+    return args.split or cfg.get("split_name") or "anomalyfree_vs_valve1_1"
+
+
+def _iter_local_stream_rows(bundle, cfg: dict, metadata: dict):
+    test_pre = _prepare_split(bundle.test_df, bundle.timestamp_col, bundle.label_col, cfg=cfg)
+    adv_columns = metadata.get("advanced_feature_columns") or None
+    raw_test = _advanced_matrix(
+        test_pre,
+        bundle.timestamp_col,
+        bundle.label_col,
+        feature_columns=adv_columns,
+    )
+    timestamps = test_pre[bundle.timestamp_col].astype(str).to_numpy()
+    for timestamp, row in zip(timestamps, raw_test, strict=False):
+        yield str(timestamp), np.asarray(row, dtype=float)
+
+
+def _fetch_json(url: str, timeout: float) -> dict:
+    with urlopen(url, timeout=timeout) as response:
+        return json.load(response)
+
+
+def _iter_api_stream_rows(args, metadata: dict):
+    base_url = (getattr(args, "api_base_url", None) or "").rstrip("/")
+    if not base_url:
+        raise ValueError("API mode requires --api-base-url")
+
+    timeout = float(getattr(args, "api_timeout", 10.0))
+    batch_size = int(getattr(args, "api_batch_size", 1))
+    cursor = int(getattr(args, "api_start_cursor", 0))
+    if batch_size < 1:
+        raise ValueError("--api-batch-size must be >= 1")
+    if cursor < 0:
+        raise ValueError("--api-start-cursor must be >= 0")
+
+    health = _fetch_json(f"{base_url}/health", timeout=timeout)
+    api_dataset = health.get("dataset")
+    if api_dataset and api_dataset != args.dataset:
+        raise ValueError(f"API dataset mismatch: expected {args.dataset}, got {api_dataset}")
+
+    value_columns = list(health.get("value_columns") or [])
+    if not value_columns:
+        raise ValueError("API health response did not include any value_columns")
+
+    expected_columns = metadata.get("advanced_feature_columns") or value_columns
+    missing = [col for col in expected_columns if col not in value_columns]
+    if missing:
+        raise ValueError(
+            "API stream is missing required value columns: "
+            + ", ".join(missing)
+        )
+
+    while True:
+        query = urlencode({"cursor": cursor, "batch_size": batch_size})
+        payload = _fetch_json(f"{base_url}/stream/next?{query}", timeout=timeout)
+        rows = payload.get("rows") or []
+        for row in rows:
+            values = row.get("values") or {}
+            ordered = []
+            for col in expected_columns:
+                if col not in values:
+                    raise ValueError(f"API row is missing required value column: {col}")
+                ordered.append(float(values[col]))
+            yield str(row.get("timestamp", "")), np.asarray(ordered, dtype=float)
+
+        next_cursor = int(payload.get("next_cursor", cursor + len(rows)))
+        done = bool(payload.get("done", False))
+        if done:
+            break
+        if not rows and next_cursor <= cursor:
+            break
+        cursor = next_cursor
+
+
+def _score_stream_window(
+    model_name: str,
+    dataset: str,
+    window_arr: np.ndarray,
+    scaler,
+    z_params,
+    iforest,
+    seq_scaler,
+    ae_model,
+    device: str,
+) -> float:
+    if model_name == "zscore":
+        feat = _stream_feature_vector(window_arr, dataset)
+        x = scaler.transform(feat) if scaler is not None else feat
+        return float(score_robust_z(x, z_params)[0])
+
+    if model_name == "iforest":
+        feat = _stream_feature_vector(window_arr, dataset)
+        x = scaler.transform(feat) if scaler is not None else feat
+        return float(-iforest.score_samples(x)[0])
+
+    scaled = seq_scaler.transform(window_arr)
+    with torch.no_grad():
+        t = torch.tensor(scaled[None, ...], dtype=torch.float32, device=device)
+        if model_name == "cnn_ae":
+            inp = t.permute(0, 2, 1)
+            recon = ae_model(inp)
+            return float(((recon - inp) ** 2).mean().item())
+        recon = ae_model(t)
+        return float(((recon - t) ** 2).mean().item())
 
 
 def train_offline(args) -> None:
@@ -392,9 +571,21 @@ def evaluate_offline(args) -> None:
     signal = signal_source[-len(test_feat):] if len(test_feat) else np.zeros(0)
 
     z_scores = score_robust_z(X_test_scaled, z_params)
-    z_pred = (z_scores > float(thresholds["zscore"])).astype(int)
     if_scores = -iforest.score_samples(X_test_scaled)
-    if_pred = (if_scores > float(thresholds["iforest"])).astype(int)
+    z_threshold, z_suppressed, z_cal = _calibrate_threshold_from_scores(
+        scores=z_scores,
+        base_threshold=float(thresholds["zscore"]),
+        cfg=cfg,
+        model_name="zscore",
+    )
+    if_threshold, if_suppressed, if_cal = _calibrate_threshold_from_scores(
+        scores=if_scores,
+        base_threshold=float(thresholds["iforest"]),
+        cfg=cfg,
+        model_name="iforest",
+    )
+    z_pred = _binary_predictions(z_scores, z_threshold, suppressed_windows=z_suppressed)
+    if_pred = _binary_predictions(if_scores, if_threshold, suppressed_windows=if_suppressed)
 
     min_collective = int(cfg.get("inference", {}).get("alert_min_segment_length", 3))
     true_events = extract_events(y_true, ts, min_collective=min_collective)
@@ -423,6 +614,8 @@ def evaluate_offline(args) -> None:
             "event_type_counts": event_type_counts(true_events),
         },
         "zscore": {
+            "threshold": z_threshold,
+            "threshold_calibration": z_cal,
             **z_metrics,
             **z_rank_metrics,
             **z_event_metrics,
@@ -431,6 +624,8 @@ def evaluate_offline(args) -> None:
             "confusion_matrix": z_cm,
         },
         "iforest": {
+            "threshold": if_threshold,
+            "threshold_calibration": if_cal,
             **if_metrics,
             **if_rank_metrics,
             **if_event_metrics,
@@ -493,7 +688,13 @@ def evaluate_offline(args) -> None:
                     model.load_state_dict(checkpoint["state_dict"])
 
                     adv_scores = reconstruction_scores(model, test_windows, device=device, model_type=model_type)
-                    adv_pred = (adv_scores > float(thresholds[model_name])).astype(int)
+                    adv_threshold, adv_suppressed, adv_cal = _calibrate_threshold_from_scores(
+                        scores=adv_scores,
+                        base_threshold=float(thresholds[model_name]),
+                        cfg=cfg,
+                        model_name=model_name,
+                    )
+                    adv_pred = _binary_predictions(adv_scores, adv_threshold, suppressed_windows=adv_suppressed)
                     adv_events = extract_events(adv_pred, ts_adv, min_collective=min_collective)
                     adv_metrics = point_metrics(y_true_adv, adv_pred)
                     adv_rank_metrics = score_metrics(y_true_adv, adv_scores)
@@ -501,6 +702,8 @@ def evaluate_offline(args) -> None:
                     adv_cm = confusion_matrix(y_true_adv, adv_pred, labels=[0, 1]).tolist()
 
                     metrics_payload[model_name] = {
+                        "threshold": adv_threshold,
+                        "threshold_calibration": adv_cal,
                         **adv_metrics,
                         **adv_rank_metrics,
                         **adv_event_metrics,
@@ -520,7 +723,7 @@ def evaluate_offline(args) -> None:
                         labels=y_true_adv,
                         scores=adv_scores,
                         preds=adv_pred,
-                        threshold=float(thresholds[model_name]),
+                        threshold=adv_threshold,
                         title=f"{args.dataset}:{variant} {model_name}",
                     )
                     _save_confusion_plot(
@@ -540,7 +743,7 @@ def evaluate_offline(args) -> None:
         labels=y_true,
         scores=z_scores,
         preds=z_pred,
-        threshold=float(thresholds["zscore"]),
+        threshold=z_threshold,
         title=f"{args.dataset}:{variant} Z-score",
     )
     _save_plot(
@@ -550,7 +753,7 @@ def evaluate_offline(args) -> None:
         labels=y_true,
         scores=if_scores,
         preds=if_pred,
-        threshold=float(thresholds["iforest"]),
+        threshold=if_threshold,
         title=f"{args.dataset}:{variant} Isolation Forest",
     )
     _save_confusion_plot(
@@ -567,6 +770,7 @@ def evaluate_offline(args) -> None:
     print(f"[eval] dataset={args.dataset} variant={variant}")
     print(f"[eval] reports={report_dir}")
     print(f"[eval] zscore_f1={z_metrics['f1']:.4f} iforest_f1={if_metrics['f1']:.4f}")
+    print(f"[eval] thresholds zscore={z_threshold:.6f} iforest={if_threshold:.6f}")
     print(
         f"[eval] zscore_event_f1={_fmt_metric(z_event_metrics['event_f1'])} "
         f"iforest_event_f1={_fmt_metric(if_event_metrics['event_f1'])}"
@@ -574,14 +778,16 @@ def evaluate_offline(args) -> None:
     if "lstm_ae" in metrics_payload or "cnn_ae" in metrics_payload:
         lstm_f1 = _fmt_metric(metrics_payload.get("lstm_ae", {}).get("f1"))
         cnn_f1 = _fmt_metric(metrics_payload.get("cnn_ae", {}).get("f1"))
+        lstm_thr = _fmt_metric(metrics_payload.get("lstm_ae", {}).get("threshold"))
+        cnn_thr = _fmt_metric(metrics_payload.get("cnn_ae", {}).get("threshold"))
         print(f"[eval] lstm_ae_f1={lstm_f1} cnn_ae_f1={cnn_f1}")
+        print(f"[eval] thresholds lstm_ae={lstm_thr} cnn_ae={cnn_thr}")
 
 
 def infer_stream_pi(args) -> None:
     config_path = getattr(args, "config", "configs/base.yaml")
     cfg = _load_runtime_config(dataset=args.dataset, base_config_path=config_path)
-    bundle = _load_bundle(args=args, cfg=cfg)
-    variant = bundle.variant
+    variant = _resolve_variant(args=args, cfg=cfg)
     artifact_dir = Path(args.artifacts_dir) / args.dataset / variant
     Path(args.log_file).parent.mkdir(parents=True, exist_ok=True)
 
@@ -591,15 +797,6 @@ def infer_stream_pi(args) -> None:
         metadata = json.load(f)
 
     window_size = int(metadata["window_size"])
-    test_pre = _prepare_split(bundle.test_df, bundle.timestamp_col, bundle.label_col, cfg=cfg)
-    adv_columns = metadata.get("advanced_feature_columns") or None
-    raw_test = _advanced_matrix(
-        test_pre,
-        bundle.timestamp_col,
-        bundle.label_col,
-        feature_columns=adv_columns,
-    )
-    timestamps = test_pre[bundle.timestamp_col].astype(str).to_numpy()
     ring = RingBuffer(window_size)
 
     scaler = None
@@ -628,47 +825,63 @@ def infer_stream_pi(args) -> None:
         ae_model.load_state_dict(ckpt["state_dict"])
         ae_model = ae_model.to(device).eval()
 
+    if args.source == "local":
+        bundle = _load_bundle(args=args, cfg=cfg)
+        variant = bundle.variant
+        stream_rows = _iter_local_stream_rows(bundle=bundle, cfg=cfg, metadata=metadata)
+    else:
+        stream_rows = _iter_api_stream_rows(args=args, metadata=metadata)
+
     threshold = float(thresholds[args.model])
+    cal = _resolve_threshold_calibration(cfg=cfg, model_name=args.model)
+    effective_threshold = threshold
+    calibration_scores: list[float] = []
+    threshold_ready = not (cal["enabled"] and cal["mode"] == "warmup_percentile" and cal["warmup_windows"] > 0)
     alerts = 0
     windows_scored = 0
+    suppressed_windows = 0
 
-    for i, row in enumerate(raw_test):
+    for timestamp, row in stream_rows:
         ring.push(row)
         if not ring.ready():
             continue
 
         win = np.asarray(ring.window(), dtype=float)
-        score = 0.0
-        if args.model == "zscore":
-            feat = _stream_feature_vector(win, args.dataset)
-            x = scaler.transform(feat) if scaler is not None else feat
-            score = float(score_robust_z(x, z_params)[0])
-        elif args.model == "iforest":
-            feat = _stream_feature_vector(win, args.dataset)
-            x = scaler.transform(feat) if scaler is not None else feat
-            score = float(-iforest.score_samples(x)[0])
-        else:
-            scaled = seq_scaler.transform(win)
-            with torch.no_grad():
-                t = torch.tensor(scaled[None, ...], dtype=torch.float32, device=device)
-                if args.model == "cnn_ae":
-                    inp = t.permute(0, 2, 1)
-                    recon = ae_model(inp)
-                    score = float(((recon - inp) ** 2).mean().item())
-                else:
-                    recon = ae_model(t)
-                    score = float(((recon - t) ** 2).mean().item())
+        score = _score_stream_window(
+            model_name=args.model,
+            dataset=args.dataset,
+            window_arr=win,
+            scaler=scaler,
+            z_params=z_params,
+            iforest=iforest,
+            seq_scaler=seq_scaler,
+            ae_model=ae_model,
+            device=device,
+        )
 
         windows_scored += 1
-        if score > threshold:
+        if not threshold_ready:
+            calibration_scores.append(score)
+            if len(calibration_scores) >= cal["warmup_windows"]:
+                effective_threshold = float(np.percentile(calibration_scores, cal["percentile"]))
+                threshold_ready = True
+            if cal["suppress_during_warmup"]:
+                suppressed_windows += 1
+                continue
+
+        if score > effective_threshold:
             append_alert(
                 log_file=args.log_file,
-                timestamp=timestamps[i],
+                timestamp=timestamp,
                 score=score,
-                threshold=threshold,
+                threshold=effective_threshold,
                 model=args.model,
             )
             alerts += 1
 
-    print(f"[infer] dataset={args.dataset} variant={variant} model={args.model}")
+    print(f"[infer] dataset={args.dataset} variant={variant} model={args.model} source={args.source}")
+    print(
+        f"[infer] base_threshold={threshold:.6f} effective_threshold={effective_threshold:.6f} "
+        f"calibration_mode={cal['mode']} suppressed_windows={suppressed_windows}"
+    )
     print(f"[infer] windows_scored={windows_scored} alerts={alerts} log_file={args.log_file}")

@@ -14,3 +14,24 @@ default_model_set:
   - iforest
   - lstm_ae
   - cnn_ae
+
+inference:
+  threshold_calibration:
+    enabled: true
+    warmup_windows: 300
+    suppress_during_warmup: true
+    default:
+      mode: artifact
+      percentile: 99.5
+    models:
+      zscore:
+        mode: warmup_percentile
+        percentile: 99.5
+      iforest:
+        mode: artifact
+      lstm_ae:
+        mode: warmup_percentile
+        percentile: 75.0
+      cnn_ae:
+        mode: warmup_percentile
+        percentile: 60.0

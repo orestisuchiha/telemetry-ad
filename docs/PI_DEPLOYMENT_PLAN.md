@@ -35,10 +35,13 @@ Goal: inference on Pi uses offline-trained artifacts.
 Goal: confirm local inference and alert logging work.
 
 1. Local dataset streaming simulation:
-   - `python scripts/infer_stream_pi.py --dataset skab --split anomalyfree_vs_valve1_1 --model lstm_ae --log-file logs/stream_lstm.csv`
+   - `python scripts/infer_stream_pi.py --dataset skab --split anomalyfree_vs_valve1_1 --model lstm_ae --source local --log-file logs/stream_lstm.csv`
 2. Repeat for all models:
    - `zscore`, `iforest`, `lstm_ae`, `cnn_ae`
 3. Confirm logs are written in `logs/`.
+4. API-backed streaming validation:
+   - `python scripts/infer_stream_pi.py --dataset skab --split anomalyfree_vs_valve1_1 --model lstm_ae --source api --api-base-url http://<tailscale-host-or-ip>:8000 --api-batch-size 32 --log-file logs/stream_lstm_api.csv`
+5. Repeat API-backed validation for the other required models.
 
 ## 5) Communication Validation via Tailscale
 
@@ -56,6 +59,6 @@ Goal: Pi can reach API host over tailnet.
 
 1. Offline train on PC.
 2. Start API server on PC.
-3. Pi pulls data over Tailscale.
-4. Pi runs local model inference.
+3. Pi pulls data over Tailscale with `--source api`.
+4. Pi runs local model inference on streamed batches.
 5. Alerts logged/shipped for presentation.
