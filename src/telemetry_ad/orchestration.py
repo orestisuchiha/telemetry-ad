@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import time
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -13,6 +14,17 @@ import pandas as pd
 import torch
 from sklearn.metrics import confusion_matrix
 from sklearn.preprocessing import StandardScaler
+try:
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.progress import BarColumn, Progress, TextColumn
+    from rich.table import Table
+
+    RICH_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    Console = Group = Live = Panel = Progress = TextColumn = BarColumn = Table = None
+    RICH_AVAILABLE = False
 
 from telemetry_ad.dataset_io import load_nab_dataset, load_skab_dataset
 from telemetry_ad.evaluation.explanations import (
@@ -550,6 +562,371 @@ def _binary_predictions(scores: np.ndarray, threshold: float, suppressed_windows
     if suppressed_windows > 0:
         pred[:suppressed_windows] = 0
     return pred
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None or not np.isfinite(seconds) or seconds < 0:
+        return "--:--"
+    total = int(round(seconds))
+    minutes, secs = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _tui_state(
+    *,
+    dataset: str,
+    variant: str,
+    model: str,
+    source: str,
+    windows_scored: int,
+    total_windows: int | None,
+    alerts: int,
+    score: float | None,
+    threshold: float,
+    calibration_mode: str,
+    warmup_progress: int,
+    warmup_target: int,
+    elapsed_seconds: float,
+) -> dict:
+    total_known = total_windows is not None and total_windows > 0
+    percent = (100.0 * windows_scored / total_windows) if total_known else None
+    rate = (windows_scored / elapsed_seconds) if elapsed_seconds > 0 else 0.0
+    eta_seconds = None
+    if total_known and rate > 0:
+        eta_seconds = max((total_windows - windows_scored) / rate, 0.0)
+
+    warmup_active = warmup_target > 0 and warmup_progress < warmup_target
+    if warmup_active:
+        calibration_line = f"Calibration: warmup {warmup_progress} / {warmup_target}"
+    else:
+        calibration_line = f"Calibration: {calibration_mode}"
+
+    if warmup_active:
+        status = "WARMUP"
+    else:
+        status = "ANOMALY" if (score is not None and score > threshold) else "NORMAL"
+    score_text = "--" if score is None else f"{score:.6f}"
+    progress_text = (
+        f"{windows_scored} / {total_windows} windows ({percent:.1f}%)"
+        if total_known
+        else f"{windows_scored} windows"
+    )
+
+    return {
+        "dataset": dataset,
+        "variant": variant,
+        "model": model,
+        "source": source,
+        "windows_scored": windows_scored,
+        "total_windows": total_windows,
+        "total_known": total_known,
+        "percent": percent,
+        "alerts": alerts,
+        "score_text": score_text,
+        "threshold": threshold,
+        "calibration_line": calibration_line,
+        "status": status,
+        "elapsed_text": _format_duration(elapsed_seconds),
+        "eta_text": _format_duration(eta_seconds),
+        "progress_text": progress_text,
+    }
+
+
+def _render_tui(
+    *,
+    dataset: str,
+    variant: str,
+    model: str,
+    source: str,
+    windows_scored: int,
+    total_windows: int | None,
+    alerts: int,
+    score: float | None,
+    threshold: float,
+    calibration_mode: str,
+    warmup_progress: int,
+    warmup_target: int,
+    elapsed_seconds: float,
+) -> str:
+    state = _tui_state(
+        dataset=dataset,
+        variant=variant,
+        model=model,
+        source=source,
+        windows_scored=windows_scored,
+        total_windows=total_windows,
+        alerts=alerts,
+        score=score,
+        threshold=threshold,
+        calibration_mode=calibration_mode,
+        warmup_progress=warmup_progress,
+        warmup_target=warmup_target,
+        elapsed_seconds=elapsed_seconds,
+    )
+
+    lines = [
+        "Telemetry AD Inference",
+        "",
+        f"Dataset: {state['dataset']}",
+        f"Variant: {state['variant']}",
+        f"Model: {state['model']}",
+        f"Source: {state['source']}",
+        "",
+        f"Progress: {state['progress_text']}",
+        f"Elapsed: {state['elapsed_text']}",
+        f"ETA: {state['eta_text']}",
+        "",
+        f"Current score: {state['score_text']}",
+        f"Threshold: {state['threshold']:.6f}",
+        f"Alerts so far: {state['alerts']}",
+        f"Status: {state['status']}",
+        state["calibration_line"],
+    ]
+    return "\n".join(lines)
+
+
+def _print_tui(frame: str) -> None:
+    print("\033[2J\033[H" + frame, end="", flush=True)
+
+
+def _print_tui_summary(
+    *,
+    dataset: str,
+    variant: str,
+    model: str,
+    source: str,
+    windows_scored: int,
+    alerts: int,
+    threshold: float,
+    elapsed_seconds: float,
+    predicted_events: list[dict],
+    interpreted_events: list[dict],
+    log_file: str,
+) -> None:
+    type_counts = event_type_counts(predicted_events)
+    op_counts = interpretation_counts(interpreted_events)
+    lines = [
+        "Inference Complete",
+        "",
+        f"Dataset: {dataset}",
+        f"Variant: {variant}",
+        f"Model: {model}",
+        f"Source: {source}",
+        "",
+        f"Windows scored: {windows_scored}",
+        f"Alerts: {alerts}",
+        f"Final threshold: {threshold:.6f}",
+        f"Elapsed: {_format_duration(elapsed_seconds)}",
+        f"Log file: {log_file}",
+        "",
+        "Detected event types",
+        f"Point: {type_counts.get('point', 0)}",
+        f"Contextual: {type_counts.get('contextual', 0)}",
+        f"Collective: {type_counts.get('collective', 0)}",
+        "",
+        "Operational interpretation",
+        f"Possible fault / short transient: {op_counts.get('possible_fault_or_short_transient', 0)}",
+        f"Possible context-dependent abnormality: {op_counts.get('possible_context_dependent_abnormality', 0)}",
+        f"Possible performance degradation / sustained fault: {op_counts.get('possible_performance_degradation_or_sustained_fault', 0)}",
+        f"Possible concept drift / setpoint shift: {op_counts.get('possible_concept_drift_or_setpoint_shift', 0)}",
+    ]
+    print("\033[2J\033[H" + "\n".join(lines))
+
+
+class _InferenceTUI:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        dataset: str,
+        variant: str,
+        model: str,
+        source: str,
+        total_windows: int | None,
+    ) -> None:
+        self.enabled = enabled
+        self.dataset = dataset
+        self.variant = variant
+        self.model = model
+        self.source = source
+        self.total_windows = total_windows
+        self.use_rich = bool(enabled and RICH_AVAILABLE)
+        self.console = None
+        self.live = None
+        self.progress = None
+        self.progress_task = None
+        if self.use_rich:
+            self.console = Console()
+            self.progress = Progress(
+                TextColumn("[bold blue]Progress[/bold blue]"),
+                BarColumn(bar_width=None),
+                TextColumn("{task.completed:>4.0f}/{task.total:.0f}" if total_windows else "{task.completed:>4.0f}"),
+                TextColumn("{task.percentage:>5.1f}%") if total_windows else TextColumn(""),
+                expand=True,
+            )
+            self.progress_task = self.progress.add_task(
+                description="Progress",
+                total=total_windows if total_windows and total_windows > 0 else None,
+                completed=0,
+            )
+            self.live = Live(console=self.console, refresh_per_second=6, transient=False)
+            self.live.start()
+
+    def update(
+        self,
+        *,
+        windows_scored: int,
+        alerts: int,
+        score: float | None,
+        threshold: float,
+        calibration_mode: str,
+        warmup_progress: int,
+        warmup_target: int,
+        elapsed_seconds: float,
+    ) -> None:
+        if not self.enabled:
+            return
+        if not self.use_rich:
+            _print_tui(
+                _render_tui(
+                    dataset=self.dataset,
+                    variant=self.variant,
+                    model=self.model,
+                    source=self.source,
+                    windows_scored=windows_scored,
+                    total_windows=self.total_windows,
+                    alerts=alerts,
+                    score=score,
+                    threshold=threshold,
+                    calibration_mode=calibration_mode,
+                    warmup_progress=warmup_progress,
+                    warmup_target=warmup_target,
+                    elapsed_seconds=elapsed_seconds,
+                )
+            )
+            return
+
+        state = _tui_state(
+            dataset=self.dataset,
+            variant=self.variant,
+            model=self.model,
+            source=self.source,
+            windows_scored=windows_scored,
+            total_windows=self.total_windows,
+            alerts=alerts,
+            score=score,
+            threshold=threshold,
+            calibration_mode=calibration_mode,
+            warmup_progress=warmup_progress,
+            warmup_target=warmup_target,
+            elapsed_seconds=elapsed_seconds,
+        )
+        self.progress.update(self.progress_task, completed=windows_scored)
+
+        meta = Table.grid(padding=(0, 2))
+        meta.add_row("[bold]Dataset[/bold]", state["dataset"])
+        meta.add_row("[bold]Variant[/bold]", state["variant"])
+        meta.add_row("[bold]Model[/bold]", state["model"])
+        meta.add_row("[bold]Source[/bold]", state["source"])
+
+        stats = Table.grid(padding=(0, 2))
+        stats.add_row("[bold]Elapsed[/bold]", state["elapsed_text"])
+        stats.add_row("[bold]ETA[/bold]", state["eta_text"])
+        stats.add_row("[bold]Current score[/bold]", state["score_text"])
+        stats.add_row("[bold]Threshold[/bold]", f"{state['threshold']:.6f}")
+        stats.add_row("[bold]Alerts[/bold]", str(state["alerts"]))
+        stats.add_row("[bold]Status[/bold]", state["status"])
+        stats.add_row("[bold]Calibration[/bold]", state["calibration_line"].replace("Calibration: ", ""))
+
+        progress_panel = Panel(
+            Group(self.progress, f"[bold]Progress[/bold]: {state['progress_text']}"),
+            title="Live Progress",
+            border_style="cyan",
+        )
+        layout = Group(
+            Panel(meta, title="Telemetry AD Inference", border_style="blue"),
+            progress_panel,
+            Panel(stats, title="Live Status", border_style="green"),
+        )
+        self.live.update(layout, refresh=True)
+
+    def finish(
+        self,
+        *,
+        windows_scored: int,
+        alerts: int,
+        threshold: float,
+        elapsed_seconds: float,
+        predicted_events: list[dict],
+        interpreted_events: list[dict],
+        log_file: str,
+    ) -> None:
+        if not self.enabled:
+            return
+        if not self.use_rich:
+            _print_tui_summary(
+                dataset=self.dataset,
+                variant=self.variant,
+                model=self.model,
+                source=self.source,
+                windows_scored=windows_scored,
+                alerts=alerts,
+                threshold=threshold,
+                elapsed_seconds=elapsed_seconds,
+                predicted_events=predicted_events,
+                interpreted_events=interpreted_events,
+                log_file=log_file,
+            )
+            return
+
+        type_counts = event_type_counts(predicted_events)
+        op_counts = interpretation_counts(interpreted_events)
+
+        summary = Table.grid(padding=(0, 2))
+        summary.add_row("[bold]Dataset[/bold]", self.dataset)
+        summary.add_row("[bold]Variant[/bold]", self.variant)
+        summary.add_row("[bold]Model[/bold]", self.model)
+        summary.add_row("[bold]Source[/bold]", self.source)
+        summary.add_row("[bold]Windows scored[/bold]", str(windows_scored))
+        summary.add_row("[bold]Alerts[/bold]", str(alerts))
+        summary.add_row("[bold]Final threshold[/bold]", f"{threshold:.6f}")
+        summary.add_row("[bold]Elapsed[/bold]", _format_duration(elapsed_seconds))
+        summary.add_row("[bold]Log file[/bold]", log_file)
+
+        event_table = Table(title="Detected Event Types", show_header=True, header_style="bold magenta")
+        event_table.add_column("Type")
+        event_table.add_column("Count", justify="right")
+        for key in ("point", "contextual", "collective"):
+            event_table.add_row(key, str(type_counts.get(key, 0)))
+
+        interp_table = Table(title="Operational Interpretation", show_header=True, header_style="bold magenta")
+        interp_table.add_column("Interpretation")
+        interp_table.add_column("Count", justify="right")
+        interp_table.add_row("Possible fault / short transient", str(op_counts.get("possible_fault_or_short_transient", 0)))
+        interp_table.add_row(
+            "Possible context-dependent abnormality",
+            str(op_counts.get("possible_context_dependent_abnormality", 0)),
+        )
+        interp_table.add_row(
+            "Possible performance degradation / sustained fault",
+            str(op_counts.get("possible_performance_degradation_or_sustained_fault", 0)),
+        )
+        interp_table.add_row(
+            "Possible concept drift / setpoint shift",
+            str(op_counts.get("possible_concept_drift_or_setpoint_shift", 0)),
+        )
+
+        dashboard = Group(
+            Panel(summary, title="Inference Complete", border_style="green"),
+            event_table,
+            interp_table,
+        )
+        self.live.stop()
+        self.console.clear()
+        self.console.print(dashboard)
 
 
 def _resolve_variant(args, cfg: dict) -> str:
@@ -1325,6 +1702,8 @@ def infer_stream_pi(args) -> None:
     variant = _resolve_variant(args=args, cfg=cfg)
     artifact_dir = Path(args.artifacts_dir) / args.dataset / variant
     Path(args.log_file).parent.mkdir(parents=True, exist_ok=True)
+    tui_enabled = bool(getattr(args, "tui", False))
+    tui_refresh_every = max(int(getattr(args, "tui_refresh_every", 25)), 1)
 
     with (artifact_dir / "thresholds.json").open("r", encoding="utf-8") as f:
         thresholds = json.load(f)
@@ -1364,9 +1743,23 @@ def infer_stream_pi(args) -> None:
         bundle = _load_bundle(args=args, cfg=cfg)
         variant = bundle.variant
         stream_rows = _iter_local_stream_rows(bundle=bundle, cfg=cfg, metadata=metadata)
+        local_pre = _prepare_split(bundle.test_df, bundle.timestamp_col, bundle.label_col, cfg=cfg)
+        total_rows = len(local_pre)
     else:
         stream_rows = _iter_api_stream_rows(args=args, metadata=metadata)
+        base_url = (getattr(args, "api_base_url", None) or "").rstrip("/")
+        health = _fetch_json(f"{base_url}/health", timeout=float(getattr(args, "api_timeout", 10.0)))
+        total_rows = int(health.get("rows", 0))
 
+    total_windows = max(total_rows - window_size + 1, 0)
+    tui = _InferenceTUI(
+        enabled=tui_enabled,
+        dataset=args.dataset,
+        variant=variant,
+        model=args.model,
+        source=args.source,
+        total_windows=total_windows,
+    )
     threshold = float(thresholds[args.model])
     cal = _resolve_threshold_calibration(cfg=cfg, model_name=args.model)
     effective_threshold = threshold
@@ -1375,6 +1768,9 @@ def infer_stream_pi(args) -> None:
     alerts = 0
     windows_scored = 0
     suppressed_windows = 0
+    scored_timestamps: list[str] = []
+    scored_predictions: list[int] = []
+    start_time = time.perf_counter()
 
     for timestamp, row in stream_rows:
         ring.push(row)
@@ -1396,6 +1792,8 @@ def infer_stream_pi(args) -> None:
         )
 
         windows_scored += 1
+        scored_timestamps.append(str(timestamp))
+        pred = 0
         if not threshold_ready:
             calibration_scores.append(score)
             if len(calibration_scores) >= cal["warmup_windows"]:
@@ -1403,6 +1801,22 @@ def infer_stream_pi(args) -> None:
                 threshold_ready = True
             if cal["suppress_during_warmup"]:
                 suppressed_windows += 1
+                scored_predictions.append(0)
+                if tui_enabled and (
+                    windows_scored == 1
+                    or windows_scored % tui_refresh_every == 0
+                    or (total_windows and windows_scored >= total_windows)
+                ):
+                    tui.update(
+                        windows_scored=windows_scored,
+                        alerts=alerts,
+                        score=score,
+                        threshold=effective_threshold,
+                        calibration_mode=cal["mode"],
+                        warmup_progress=len(calibration_scores),
+                        warmup_target=int(cal.get("warmup_windows", 0)),
+                        elapsed_seconds=time.perf_counter() - start_time,
+                    )
                 continue
 
         if score > effective_threshold:
@@ -1414,10 +1828,53 @@ def infer_stream_pi(args) -> None:
                 model=args.model,
             )
             alerts += 1
+            pred = 1
+        scored_predictions.append(pred)
 
-    print(f"[infer] dataset={args.dataset} variant={variant} model={args.model} source={args.source}")
-    print(
-        f"[infer] base_threshold={threshold:.6f} effective_threshold={effective_threshold:.6f} "
-        f"calibration_mode={cal['mode']} suppressed_windows={suppressed_windows}"
+        if tui_enabled and (
+            windows_scored == 1
+            or windows_scored % tui_refresh_every == 0
+            or (total_windows and windows_scored >= total_windows)
+        ):
+            tui.update(
+                windows_scored=windows_scored,
+                alerts=alerts,
+                score=score,
+                threshold=effective_threshold,
+                calibration_mode=cal["mode"],
+                warmup_progress=len(calibration_scores),
+                warmup_target=int(cal.get("warmup_windows", 0)),
+                elapsed_seconds=time.perf_counter() - start_time,
+            )
+
+    elapsed_seconds = time.perf_counter() - start_time
+    min_collective = int(cfg.get("inference", {}).get("alert_min_segment_length", 3))
+    interpretation_cfg = cfg.get("interpretation", {})
+    drift_min_length = int(interpretation_cfg.get("drift_min_length", 120))
+    drift_length_ratio = float(interpretation_cfg.get("drift_length_ratio", 0.25))
+    predicted_events = extract_events(scored_predictions, scored_timestamps, min_collective=min_collective)
+    interpreted_events = interpret_events(
+        predicted_events,
+        total_points=max(len(scored_predictions), 1),
+        drift_min_length=drift_min_length,
+        drift_length_ratio=drift_length_ratio,
     )
-    print(f"[infer] windows_scored={windows_scored} alerts={alerts} log_file={args.log_file}")
+
+    if tui_enabled:
+        tui.finish(
+            windows_scored=windows_scored,
+            alerts=alerts,
+            threshold=effective_threshold,
+            elapsed_seconds=elapsed_seconds,
+            predicted_events=predicted_events,
+            interpreted_events=interpreted_events,
+            log_file=args.log_file,
+        )
+
+    if not tui_enabled:
+        print(f"[infer] dataset={args.dataset} variant={variant} model={args.model} source={args.source}")
+        print(
+            f"[infer] base_threshold={threshold:.6f} effective_threshold={effective_threshold:.6f} "
+            f"calibration_mode={cal['mode']} suppressed_windows={suppressed_windows}"
+        )
+        print(f"[infer] windows_scored={windows_scored} alerts={alerts} log_file={args.log_file}")

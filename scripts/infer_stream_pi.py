@@ -27,6 +27,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-batch-size", type=int, default=32, help="Rows per /stream/next request in API mode")
     parser.add_argument("--api-start-cursor", type=int, default=0, help="Initial API cursor in API mode")
     parser.add_argument("--api-timeout", type=float, default=10.0, help="HTTP timeout in seconds for API mode")
+    parser.add_argument("--tui", action="store_true", help="Show a lightweight live terminal dashboard during inference")
+    parser.add_argument(
+        "--tui-refresh-every",
+        type=int,
+        default=20,
+        help="Refresh the live dashboard every N scored windows when --tui is enabled",
+    )
     return parser.parse_args()
 
 
