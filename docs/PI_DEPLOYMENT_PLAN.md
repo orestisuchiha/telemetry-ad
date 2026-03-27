@@ -1,6 +1,9 @@
-# Raspberry Pi Deployment Plan (Remaining Steps)
+# Raspberry Pi Deployment Plan
 
-This is the final roadmap phase after model implementation.
+Current status:
+- Pi inference has been validated in Python virtual environment mode.
+- Local and API-backed streaming were validated on the Pi.
+- Docker/container proof on the Pi is still optional/pending.
 
 ## 1) Backend/API Host (PC or Server)
 
@@ -62,3 +65,12 @@ Goal: Pi can reach API host over tailnet.
 3. Pi pulls data over Tailscale with `--source api`.
 4. Pi runs local model inference on streamed batches.
 5. Alerts logged/shipped for presentation.
+
+## 7) Optional Docker Proof
+
+Use this only if containerized Pi execution needs to be demonstrated explicitly.
+
+1. Build on the Pi:
+   - `docker build -t telemetry-ad .`
+2. Run one inference command in the container:
+   - `docker run --rm -v "$PWD:/app" telemetry-ad python scripts/infer_stream_pi.py --dataset skab --split anomalyfree_vs_valve1_1 --model iforest --source api --api-base-url http://<tailscale-host-or-ip>:8000 --api-batch-size 32 --log-file logs/pi_iforest_api_docker.csv`

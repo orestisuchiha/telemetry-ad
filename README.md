@@ -6,7 +6,7 @@ End-to-end anomaly detection pipeline for time-series telemetry using NAB and SK
 - Offline training and evaluation are implemented for 4 models.
 - Local end-to-end API-backed streaming has been validated.
 - Raspberry Pi deployment scripts and API pull-mode support are included.
-- Real hardware validation on the Raspberry Pi is still pending.
+- Raspberry Pi inference has been validated in venv mode; Docker-on-Pi proof is still optional/pending.
 
 ## Scope
 - Datasets:
@@ -53,6 +53,13 @@ pip install -r requirements.txt
 pip install -r requirements-api.txt
 ```
 
+Equivalent package install:
+
+```bash
+pip install .
+pip install .[api]
+```
+
 ## Quickstart
 
 ### SKAB: train and evaluate
@@ -85,6 +92,148 @@ python scripts/train_offline.py --dataset nab --series ec2_cpu_utilization_5f553
 python scripts/evaluate_offline.py --dataset nab --series ec2_cpu_utilization_5f5533
 ```
 
+## PC-to-Pi Runbook
+
+This is the recommended end-to-end workflow when training on a PC and running inference on a Raspberry Pi.
+
+### 1. On the PC: activate the environment
+If you use the project Miniforge environment:
+
+```bash
+conda activate telemetry-ad
+```
+
+### 2. On the PC: train offline
+SKAB example:
+
+```bash
+python scripts/train_offline.py --dataset skab --split anomalyfree_vs_valve1_1
+python scripts/evaluate_offline.py --dataset skab --split anomalyfree_vs_valve1_1
+```
+
+NAB example:
+
+```bash
+python scripts/train_offline.py --dataset nab --series ec2_cpu_utilization_5f5533
+python scripts/evaluate_offline.py --dataset nab --series ec2_cpu_utilization_5f5533
+```
+
+Use offline training and evaluation whenever you want:
+- trained artifacts in `artifacts/<dataset>/<variant>/`
+- metrics and plots in `reports/<dataset>/<variant>/`
+- notebook-ready results before moving to streaming or Pi deployment
+
+### 3. On the PC: start the telemetry API if the Pi will pull streamed data
+
+```bash
+python scripts/serve_stream_api.py --dataset skab --split anomalyfree_vs_valve1_1 --host 0.0.0.0 --port 8000
+```
+
+Check that it is alive:
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+If you use Tailscale for Pi-to-PC communication, keep note of the PC Tailscale hostname or IP.
+
+### 4. On the Pi: clone and set up the repo
+
+```bash
+git clone <repo-url>
+cd telemetry-ad
+bash scripts/pi_setup.sh
+source .venv/bin/activate
+```
+
+### 5. On the Pi: run preflight
+
+```bash
+python scripts/pi_preflight.py --api-base-url http://<tailscale-host-or-ip>:8000
+```
+
+### 6. Copy offline artifacts from the PC to the Pi
+At minimum, copy the required variant folder from:
+- `artifacts/skab/anomalyfree_vs_valve1_1/`
+- or `artifacts/nab/<series>/`
+
+The Pi needs the trained artifact files before inference:
+- `thresholds.json`
+- `metadata.json`
+- baseline model files such as `iforest.pkl` and `zscore_params.pkl`
+- advanced model files such as `lstm_ae.pt`, `cnn_ae.pt`, `seq_scaler.pkl`
+
+### 7. Choose local or API streaming on the Pi
+
+`local` mode:
+- replays the dataset test split directly from files on the Pi
+- best for quick validation when you only want to confirm inference works
+
+`api` mode:
+- pulls telemetry batches from the PC over `GET /stream/next`
+- best for the full deployment-style demo
+
+### 8. On the Pi: local streaming inference
+Example:
+
+```bash
+python scripts/infer_stream_pi.py --dataset skab --split anomalyfree_vs_valve1_1 --model iforest --source local --log-file logs/pi_iforest_local.csv
+```
+
+Repeat for:
+- `zscore`
+- `iforest`
+- `lstm_ae`
+- `cnn_ae`
+
+### 9. On the Pi: API-backed streaming inference
+Example:
+
+```bash
+python scripts/infer_stream_pi.py --dataset skab --split anomalyfree_vs_valve1_1 --model iforest --source api --api-base-url http://<tailscale-host-or-ip>:8000 --api-batch-size 32 --log-file logs/pi_iforest_api.csv
+```
+
+Repeat for:
+- `zscore`
+- `iforest`
+- `lstm_ae`
+- `cnn_ae`
+
+### 10. Optional: live TUI during inference
+For a richer terminal presentation on PC or Pi:
+
+```bash
+python scripts/infer_stream_pi.py --dataset skab --split anomalyfree_vs_valve1_1 --model iforest --source api --api-base-url http://<tailscale-host-or-ip>:8000 --api-batch-size 32 --tui --tui-refresh-every 100 --log-file logs/pi_iforest_api.csv
+```
+
+### 11. Offline vs streaming: when to use each
+
+Offline commands:
+- `train_offline.py`
+- `evaluate_offline.py`
+
+Use them when you want:
+- model training
+- threshold review
+- metrics, plots, explainability, interpretation, and non-stationarity outputs
+
+Streaming commands:
+- `serve_stream_api.py`
+- `infer_stream_pi.py`
+
+Use them when you want:
+- sliding-window inference
+- live or replayed detection behavior
+- Raspberry Pi validation
+- local-vs-API deployment testing
+
+### 12. What to verify after a successful Pi run
+Confirm that:
+- alert CSVs were written under `logs/`
+- the model loaded the correct artifact folder
+- local and API runs produce comparable thresholds and alert counts
+- the PC API remains reachable during `--source api`
+
 ## Streaming Modes
 `scripts/infer_stream_pi.py` supports:
 - `--source local`
@@ -112,6 +261,8 @@ docker run --rm -v ${PWD}:/app telemetry-ad python scripts/infer_stream_pi.py --
 ```
 
 ## Raspberry Pi Quickstart
+Validated path: Python virtual environment on the Pi. Docker-on-Pi remains optional if container proof is needed.
+
 After cloning the repo on the Pi:
 
 ```bash
